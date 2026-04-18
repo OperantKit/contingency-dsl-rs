@@ -773,6 +773,11 @@ impl Parser {
         let mut params: Option<BTreeMap<String, AnnotationValue>> = None;
         if self.at(TokenType::LParen) {
             self.advance();
+            // Bare `()` => empty params bag so the serializer emits
+            // `params: {}` to satisfy probe_policy-style fixtures.
+            if self.at(TokenType::RParen) {
+                params = Some(BTreeMap::new());
+            }
             if !self.at(TokenType::RParen) {
                 // First arg: either <positional> or <kw>=<value>.
                 let kv = self.parse_annotation_arg()?;
@@ -1924,8 +1929,13 @@ impl Parser {
                         JsonValue::Object(m)
                     } else if vt.ty == TokenType::StringLiteral {
                         self.advance();
+                        let mode_str = match vt.value.as_str() {
+                            "repeat_until_correct" => "unlimited".to_string(),
+                            "no_correction" => "disabled".to_string(),
+                            other => other.to_string(),
+                        };
                         let mut m = BTreeMap::new();
-                        m.insert("mode".into(), JsonValue::String(vt.value));
+                        m.insert("mode".into(), JsonValue::String(mode_str));
                         JsonValue::Object(m)
                     } else {
                         return Err(DslError::parse(
@@ -1987,13 +1997,17 @@ impl Parser {
                     }))),
                 );
             }
+            // falseAlarm inherits from incorrect when not specified so
+            // miss and false-alarm receive the same consequence per
+            // conformance gonogo_with_incorrect.
             if !params.contains_key("falseAlarm") {
-                params.insert(
-                    "falseAlarm".into(),
-                    TrialParam::Schedule(Box::new(ScheduleExpr::Special(Special {
+                let inherited = match params.get("incorrect") {
+                    Some(TrialParam::Schedule(s)) => TrialParam::Schedule(s.clone()),
+                    _ => TrialParam::Schedule(Box::new(ScheduleExpr::Special(Special {
                         kind: SpecialKind::Ext,
                     }))),
-                );
+                };
+                params.insert("falseAlarm".into(), inherited);
             }
         }
 

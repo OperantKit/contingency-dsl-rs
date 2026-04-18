@@ -665,14 +665,20 @@ fn annotation_to_json(a: &Annotation) -> JsonValue {
     if let Some(pos) = &a.positional {
         m.insert("positional".into(), annotation_value_to_json(pos));
     }
-    if let Some(params) = &a.params {
-        let mut pm = BTreeMap::new();
-        for (k, v) in params {
-            pm.insert(k.clone(), annotation_value_to_json(v));
+    // Emit `params` (and the paper-layer alias `kwargs`) whenever kwargs
+    // bag is set, even if empty. Fixtures like @probe_policy() expect
+    // params: {} to be present.
+    let pm = match &a.params {
+        Some(params) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in params {
+                out.insert(k.clone(), annotation_value_to_json(v));
+            }
+            Some(out)
         }
-        // Paper-layer fixtures use `kwargs`; other layers use `params`.
-        // Emit both so either conformance shape matches under subset
-        // comparison.
+        None => None,
+    };
+    if let Some(pm) = pm {
         m.insert("params".into(), JsonValue::Object(pm.clone()));
         m.insert("kwargs".into(), JsonValue::Object(pm));
     }
