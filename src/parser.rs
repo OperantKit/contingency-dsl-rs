@@ -347,8 +347,6 @@ impl Parser {
         let label_tok = self.expect(TokenType::Identifier, "shaping label")?;
         self.expect(TokenType::Colon, ": after shaping label")?;
         self.skip_newlines();
-        // Collect shaping-metadata kwargs into a param-map for the
-        // @procedure annotation that gets emitted on the desugared phase.
         let mut target: Option<String> = None;
         let mut method: String = "artful".into();
         let mut approximations: Option<Vec<JsonValue>> = None;
@@ -356,8 +354,76 @@ impl Parser {
         let mut percentile_rank: Option<i64> = None;
         let mut percentile_window: Option<i64> = None;
         let mut percentile_dir: Option<String> = None;
+        let mut user_criterion: Option<crate::experiment::Criterion> = None;
+        let mut min_sessions: Option<i64> = None;
         loop {
             self.skip_newlines();
+            if self.at(TokenType::Sessions) {
+                self.advance();
+                if self.at(TokenType::Equals) {
+                    self.advance();
+                    let nt = self.expect(TokenType::Number, "sessions count")?;
+                    user_criterion =
+                        Some(crate::experiment::Criterion::FixedSessions(
+                            crate::experiment::FixedSessions {
+                                count: nt.value.parse().unwrap_or(0),
+                            },
+                        ));
+                } else if self.at(TokenType::Gte) {
+                    self.advance();
+                    let nt = self.expect(TokenType::Number, "min sessions")?;
+                    min_sessions = Some(nt.value.parse().unwrap_or(0));
+                }
+                continue;
+            }
+            if self.at(TokenType::Stable) {
+                self.advance();
+                self.expect(TokenType::LParen, "( after stable")?;
+                let method_tok = self.expect(TokenType::Identifier, "stability method")?;
+                let mut window_sessions: Option<i64> = None;
+                let mut max_change_pct: Option<f64> = None;
+                let mut measure: Option<String> = None;
+                while self.at(TokenType::Comma) {
+                    self.advance();
+                    let key = self.expect(TokenType::Identifier, "stable kwarg")?;
+                    self.expect(TokenType::Equals, "=")?;
+                    match key.value.as_str() {
+                        "window" => {
+                            let nt = self.expect(TokenType::Number, "window")?;
+                            window_sessions = Some(nt.value.parse().unwrap_or(0));
+                        }
+                        "threshold" => {
+                            let nt = self.expect(TokenType::Number, "threshold")?;
+                            let v: f64 = nt.value.parse().unwrap_or(0.0);
+                            if self.at(TokenType::Percent) {
+                                self.advance();
+                            }
+                            max_change_pct = Some(v);
+                        }
+                        "measure" => {
+                            let vt = self.expect(TokenType::Identifier, "measure")?;
+                            measure = Some(vt.value);
+                        }
+                        _ => {
+                            return Err(DslError::parse(
+                                format!("unknown stable kwarg '{}'", key.value),
+                                SourceSpan::new(key.line, key.col),
+                            ))
+                        }
+                    }
+                }
+                self.expect(TokenType::RParen, ") on stable")?;
+                user_criterion = Some(crate::experiment::Criterion::Stability(
+                    crate::experiment::Stability {
+                        method: method_tok.value,
+                        window_sessions,
+                        max_change_pct,
+                        min_sessions,
+                        measure,
+                    },
+                ));
+                continue;
+            }
             if !self.at(TokenType::Identifier) {
                 break;
             }
@@ -371,6 +437,7 @@ impl Parser {
                     | "percentile_rank"
                     | "percentile_window"
                     | "percentile_dir"
+                    | "stages"
             ) {
                 break;
             }
@@ -417,7 +484,31 @@ impl Parser {
                         other => annotation_value_to_string(&other),
                     });
                 }
+                "stages" => {
+                    // Staged shaping: `stages = [CRF, DRH2s, DRH1s]`.
+                    // Not supported yet; return a parse error pointing at
+                    // the keyword.
+                    return Err(DslError::parse(
+                        format!("SHAPING_STAGED_NOT_SUPPORTED: {:?}", v),
+                        SourceSpan::new(label_tok.line, label_tok.col),
+                    ));
+                }
                 _ => {}
+            }
+        }
+        // Promote min_sessions into a Stability criterion if stable() was
+        // not seen but sessions >= N was declared.
+        if user_criterion.is_none() {
+            if let Some(n) = min_sessions {
+                user_criterion = Some(crate::experiment::Criterion::Stability(
+                    crate::experiment::Stability {
+                        method: String::new(),
+                        window_sessions: None,
+                        max_change_pct: None,
+                        min_sessions: Some(n),
+                        measure: None,
+                    },
+                ));
             }
         }
         let target = target.ok_or_else(|| {
@@ -466,8 +557,10 @@ impl Parser {
         Ok(vec![crate::experiment::Phase {
             label: label_tok.value,
             schedule: crate::experiment::PhaseSchedule::Operant(schedule),
-            criterion: crate::experiment::Criterion::ExperimenterJudgment(
-                crate::experiment::ExperimenterJudgment,
+            criterion: user_criterion.unwrap_or(
+                crate::experiment::Criterion::ExperimenterJudgment(
+                    crate::experiment::ExperimenterJudgment,
+                ),
             ),
             annotations: vec![proc_ann],
         }])
