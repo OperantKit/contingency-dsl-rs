@@ -24,10 +24,11 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Atomic, Binding, CombinatorParamValue, Compound, CompoundParam, DirRef, DirectionalCOD,
-    DirectionalEntry, IdentifierRef, JsonValue, LimitedHold, Modifier, ModifierKind, ParamDecl,
-    Program, ProgramSchedule, PunishParam, ResponseCost, ResponseCostWrapped, ScheduleExpr,
-    ScheduleType, SecondOrder, Special, SpecialKind, Timeout, TimeoutWrapped,
+    Atomic, AversiveKind, AversiveParam, AversiveSchedule, Binding, CombinatorParamValue, Compound,
+    CompoundParam, DirRef, DirectionalCOD, DirectionalEntry, IdentifierRef, JsonValue, LimitedHold,
+    Modifier, ModifierKind, NumericPayload, ParamDecl, Program, ProgramSchedule, PunishParam,
+    ResponseCost, ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder, Special,
+    SpecialKind, Timeout, TimeoutWrapped,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -426,14 +427,21 @@ impl Parser {
                 self.parse_repeat_shorthand()
             }
             TokenType::Identifier => {
-                // Lag N / LagN / Lag(N[, length=N])
                 let peek_val = self.peek().value.clone();
+                let next_is_lparen = self
+                    .peek_at(1)
+                    .map_or(false, |n| n.ty == TokenType::LParen);
+                // Lag N / LagN / Lag(N[, length=N])
                 if peek_val == "Lag"
                     || (peek_val.starts_with("Lag")
                         && peek_val[3..].chars().all(|c| c.is_ascii_digit())
                         && !peek_val[3..].is_empty())
                 {
                     return self.parse_lag();
+                }
+                // Aversive schedule calls: Sidman(...), DiscrimAv(...), Escape(...)
+                if next_is_lparen && aversive_kind(&peek_val).is_some() {
+                    return self.parse_aversive_schedule();
                 }
                 let tok = self.advance();
                 let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
@@ -935,6 +943,95 @@ impl Parser {
         }))
     }
 
+    fn parse_aversive_schedule(&mut self) -> Result<ScheduleExpr> {
+        let name_tok = self.expect(TokenType::Identifier, "aversive schedule name")?;
+        let kind = aversive_kind(&name_tok.value).ok_or_else(|| {
+            DslError::parse(
+                format!("unknown aversive schedule '{}'", name_tok.value),
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        let open_tok = self.expect(TokenType::LParen, "( after aversive name")?;
+        let mut params: BTreeMap<String, AversiveParam> = BTreeMap::new();
+        if !self.at(TokenType::RParen) {
+            self.parse_aversive_param(&mut params, kind)?;
+            while self.at(TokenType::Comma) {
+                self.advance();
+                self.parse_aversive_param(&mut params, kind)?;
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on aversive")?;
+        validate_aversive_params(kind, &params, &open_tok)?;
+        Ok(ScheduleExpr::AversiveSchedule(AversiveSchedule {
+            kind,
+            params,
+        }))
+    }
+
+    fn parse_aversive_param(
+        &mut self,
+        params: &mut BTreeMap<String, AversiveParam>,
+        kind: AversiveKind,
+    ) -> Result<()> {
+        let key_tok = self.expect(TokenType::Identifier, "aversive parameter name")?;
+        let canonical = aversive_param_alias(&key_tok.value).ok_or_else(|| {
+            DslError::parse(
+                format!("unknown aversive parameter '{}'", key_tok.value),
+                SourceSpan::new(key_tok.line, key_tok.col),
+            )
+        })?;
+        if params.contains_key(canonical) {
+            return Err(DslError::parse(
+                format!(
+                    "AVERSIVE_DUPLICATE_PARAM: '{}' appears twice in {}(...)",
+                    canonical,
+                    kind.as_str()
+                ),
+                SourceSpan::new(key_tok.line, key_tok.col),
+            ));
+        }
+        self.expect(TokenType::Equals, "= after aversive param")?;
+        if canonical == "mode" {
+            let mt = self.peek().clone();
+            if !matches!(mt.ty, TokenType::Identifier | TokenType::DistributionName) {
+                return Err(DslError::parse(
+                    format!(
+                        "expected identifier for 'mode' value, got {:?} '{}'",
+                        mt.ty, mt.value
+                    ),
+                    SourceSpan::new(mt.line, mt.col),
+                ));
+            }
+            if !matches!(mt.value.as_str(), "escape" | "fixed" | "response_terminated") {
+                return Err(DslError::parse(
+                    format!("AVERSIVE_INVALID_MODE: got '{}'", mt.value),
+                    SourceSpan::new(mt.line, mt.col),
+                ));
+            }
+            self.advance();
+            params.insert(canonical.to_string(), AversiveParam::Str(mt.value));
+            return Ok(());
+        }
+        let (v, u) = self.parse_value()?;
+        if u.is_none() {
+            return Err(DslError::parse(
+                format!("AVERSIVE_MISSING_TIME_UNIT: '{}'", canonical),
+                SourceSpan::new(key_tok.line, key_tok.col),
+            ));
+        }
+        if v <= 0.0 {
+            return Err(DslError::parse(
+                format!("AVERSIVE_NONPOSITIVE_VALUE: '{}' got {}", canonical, v),
+                SourceSpan::new(key_tok.line, key_tok.col),
+            ));
+        }
+        params.insert(
+            canonical.to_string(),
+            AversiveParam::Numeric(NumericPayload { value: v, time_unit: u }),
+        );
+        Ok(())
+    }
+
     fn parse_lag(&mut self) -> Result<ScheduleExpr> {
         let tok = self.expect(TokenType::Identifier, "Lag")?;
         // Lag5 compact form.
@@ -1224,6 +1321,66 @@ impl Parser {
             SourceSpan::new(t.line, t.col),
         ))
     }
+}
+
+fn aversive_kind(name: &str) -> Option<AversiveKind> {
+    match name {
+        "Sidman" | "SidmanAv" | "SidmanAvoidance" => Some(AversiveKind::Sidman),
+        "DiscrimAv" | "DiscriminatedAvoidance" => Some(AversiveKind::DiscrimAv),
+        "Escape" => Some(AversiveKind::Escape),
+        _ => None,
+    }
+}
+
+fn aversive_param_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "SSI" | "ShockShockInterval" => Some("SSI"),
+        "RSI" | "ResponseShockInterval" => Some("RSI"),
+        "ITI" | "IntertrialInterval" => Some("ITI"),
+        "CSUSInterval" => Some("CSUSInterval"),
+        "SafeDuration" => Some("SafeDuration"),
+        "MaxShock" => Some("MaxShock"),
+        "ShockDuration" => Some("ShockDuration"),
+        "mode" => Some("mode"),
+        _ => None,
+    }
+}
+
+fn validate_aversive_params(
+    kind: AversiveKind,
+    params: &BTreeMap<String, AversiveParam>,
+    anchor: &Token,
+) -> Result<()> {
+    let span = || SourceSpan::new(anchor.line, anchor.col);
+    match kind {
+        AversiveKind::Sidman => {
+            if !params.contains_key("SSI") {
+                return Err(DslError::parse("SIDMAN_MISSING_SSI", span()));
+            }
+            if !params.contains_key("RSI") {
+                return Err(DslError::parse("SIDMAN_MISSING_RSI", span()));
+            }
+        }
+        AversiveKind::DiscrimAv => {
+            if !params.contains_key("CSUSInterval") {
+                return Err(DslError::parse("DISCRIMAV_MISSING_CSUS_INTERVAL", span()));
+            }
+            if let Some(AversiveParam::Str(m)) = params.get("mode") {
+                if m == "fixed" && !params.contains_key("ShockDuration") {
+                    return Err(DslError::parse(
+                        "DISCRIMAV_FIXED_MISSING_SHOCK_DURATION",
+                        span(),
+                    ));
+                }
+            }
+        }
+        AversiveKind::Escape => {
+            if !params.contains_key("ShockDuration") {
+                return Err(DslError::parse("ESCAPE_MISSING_SHOCK_DURATION", span()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_dir_ref(
