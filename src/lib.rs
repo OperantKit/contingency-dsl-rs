@@ -8,8 +8,10 @@ pub mod enums;
 pub mod errors;
 pub mod experiment;
 pub mod lexer;
+pub mod serializer;
 pub mod tokens;
 
 pub use errors::{DslError, DslErrorKind, Result, SourceSpan};
 pub use lexer::tokenize;
+pub use serializer::{expr_to_json, json_to_string, program_to_json};
 pub use tokens::{Token, TokenType};
