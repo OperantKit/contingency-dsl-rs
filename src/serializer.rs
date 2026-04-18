@@ -765,11 +765,14 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             m.insert("p_us_given_no_cs".into(), JsonValue::Float(*p_us_no_cs));
             JsonValue::Object(m)
         }
-        RespondentExpr::TrulyRandom(TrulyRandom { cs, us, .. }) => {
+        RespondentExpr::TrulyRandom(TrulyRandom { cs, us, p, .. }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("TrulyRandom".into()));
             m.insert("cs".into(), JsonValue::String(cs.clone()));
             m.insert("us".into(), JsonValue::String(us.clone()));
+            if let Some(pv) = p {
+                m.insert("p".into(), JsonValue::Float(*pv));
+            }
             JsonValue::Object(m)
         }
         RespondentExpr::ExplicitlyUnpaired(ExplicitlyUnpaired { cs, us, min_separation }) => {
@@ -780,14 +783,14 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             m.insert("min_separation".into(), duration_to_json(min_separation));
             JsonValue::Object(m)
         }
-        RespondentExpr::Compound(RespondentCompound { stimuli }) => {
+        RespondentExpr::Compound(RespondentCompound { stimuli, mode }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("Compound".into()));
             m.insert(
                 "cs_list".into(),
                 JsonValue::Array(stimuli.iter().cloned().map(JsonValue::String).collect()),
             );
-            m.insert("mode".into(), JsonValue::String("overlap".into()));
+            m.insert("mode".into(), JsonValue::String(mode.clone()));
             JsonValue::Object(m)
         }
         RespondentExpr::Serial(RespondentSerial { stimuli, isis }) => {
@@ -822,7 +825,9 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             m.insert("type".into(), JsonValue::String("Differential".into()));
             m.insert("cs_positive".into(), JsonValue::String(cs_plus.clone()));
             m.insert("cs_negative".into(), JsonValue::String(cs_minus.clone()));
-            m.insert("us".into(), JsonValue::String(us.clone()));
+            if !us.is_empty() {
+                m.insert("us".into(), JsonValue::String(us.clone()));
+            }
             JsonValue::Object(m)
         }
         RespondentExpr::Extension(ext) => respondent_extension_to_json(ext),

@@ -455,6 +455,30 @@ fn parse_contingency(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
         p.expect(TokenType::Comma, ",")?;
         let nt2 = p.expect(TokenType::Number, "p_us_no_cs")?;
         p_us_no_cs = Some(nt2.value.parse().unwrap_or(0.0));
+    } else if p.at(TokenType::Identifier)
+        && (p.peek().value == "p_us_given_cs" || p.peek().value == "p_us_given_no_cs")
+    {
+        // Kwargs-only form without cs/us.
+        loop {
+            let key = p.expect(TokenType::Identifier, "Contingency kwarg")?;
+            p.expect(TokenType::Equals, "=")?;
+            let nt = p.expect(TokenType::Number, "probability")?;
+            let v: f64 = nt.value.parse().unwrap_or(0.0);
+            match key.value.as_str() {
+                "p_us_given_cs" => p_us_given_cs = Some(v),
+                "p_us_given_no_cs" | "p_us_no_cs" => p_us_no_cs = Some(v),
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown Contingency kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+            if !p.at(TokenType::Comma) {
+                break;
+            }
+            p.advance();
+        }
     } else {
         cs = parse_single_stim_arg(p, "cs")?;
         p.expect(TokenType::Comma, ",")?;
@@ -501,6 +525,7 @@ fn parse_truly_random(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     let us = parse_single_stim_arg(p, "us")?;
     let mut rate_cs = 0.0;
     let mut rate_us = 0.0;
+    let mut p_value: Option<f64> = None;
     while p.at(TokenType::Comma) {
         p.advance();
         let key = p.expect(TokenType::Identifier, "TrulyRandom kwarg")?;
@@ -512,12 +537,12 @@ fn parse_truly_random(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
                 SourceSpan::new(nt.line, nt.col),
             )
         })?;
-        // Skip optional time-unit suffix on rate values.
         if p.at(TokenType::TimeUnit) {
             p.advance();
         }
         match key.value.as_str() {
-            "rate_cs" | "p" => rate_cs = v,
+            "p" => p_value = Some(v),
+            "rate_cs" => rate_cs = v,
             "rate_us" => rate_us = v,
             _ => {
                 return Err(DslError::parse(
@@ -534,6 +559,7 @@ fn parse_truly_random(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
             us,
             rate_cs,
             rate_us,
+            p: p_value,
         }),
     )))
 }
@@ -574,6 +600,11 @@ fn parse_explicitly_unpaired(p: &mut crate::parser::Parser) -> Result<ScheduleEx
 fn parse_compound_primitive(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     p.advance();
     p.expect(TokenType::LParen, "( after Compound")?;
+    // cs_list either positional `[...]` or kwarg `cs_list=[...]`.
+    if p.at(TokenType::Identifier) && p.peek().value == "cs_list" {
+        p.advance();
+        p.expect(TokenType::Equals, "=")?;
+    }
     p.expect(TokenType::LBracket, "[")?;
     let mut stimuli = Vec::new();
     if !p.at(TokenType::RBracket) {
@@ -584,24 +615,29 @@ fn parse_compound_primitive(p: &mut crate::parser::Parser) -> Result<ScheduleExp
         }
     }
     p.expect(TokenType::RBracket, "]")?;
-    // Optional mode=overlap|sequential kwarg (ignored here; default "overlap").
+    let mut mode = String::from("Simultaneous");
     while p.at(TokenType::Comma) {
         p.advance();
         let key = p.expect(TokenType::Identifier, "Compound kwarg name")?;
         p.expect(TokenType::Equals, "=")?;
-        // Consume the value to advance the stream.
-        let _v = p.advance();
-        let _ = key;
+        let v = p.advance();
+        if key.value == "mode" {
+            mode = v.value;
+        }
     }
     p.expect(TokenType::RParen, ")")?;
     Ok(ScheduleExpr::Respondent(Box::new(RespondentExpr::Compound(
-        RespondentCompound { stimuli },
+        RespondentCompound { stimuli, mode },
     ))))
 }
 
 fn parse_serial_primitive(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     p.advance();
     p.expect(TokenType::LParen, "( after Serial")?;
+    if p.at(TokenType::Identifier) && p.peek().value == "cs_list" {
+        p.advance();
+        p.expect(TokenType::Equals, "=")?;
+    }
     p.expect(TokenType::LBracket, "[")?;
     let mut stimuli = Vec::new();
     if !p.at(TokenType::RBracket) {
@@ -644,7 +680,17 @@ fn parse_iti_primitive(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     let mut uniform_min: Option<Duration> = None;
     let mut uniform_max: Option<Duration> = None;
     let mut exponential: Option<Duration> = None;
-    let mut seen_first = false;
+    // Optional leading positional distribution identifier (fixed / uniform /
+    // exponential) shorthand for `mode=<name>`.
+    let head = p.peek().clone();
+    let leading_dist = matches!(head.ty, TokenType::Identifier | TokenType::DistributionName)
+        && matches!(head.value.as_str(), "fixed" | "uniform" | "exponential")
+        && p.peek_at(1).map_or(false, |n| n.ty == TokenType::Comma || n.ty == TokenType::RParen);
+    if leading_dist {
+        p.advance();
+        mode = head.value;
+    }
+    let mut seen_first = leading_dist;
     while !p.at(TokenType::RParen) {
         if seen_first {
             p.expect(TokenType::Comma, ", after ITI kwarg")?;
@@ -664,7 +710,7 @@ fn parse_iti_primitive(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
         p.advance();
         p.expect(TokenType::Equals, "= after ITI kwarg")?;
         match key_name.as_str() {
-            "mode" => {
+            "mode" | "distribution" => {
                 let vt = p.advance();
                 mode = vt.value;
             }

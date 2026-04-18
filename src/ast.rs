@@ -458,6 +458,7 @@ pub struct TrulyRandom {
     pub us: String,
     pub rate_cs: f64,
     pub rate_us: f64,
+    pub p: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -470,6 +471,7 @@ pub struct ExplicitlyUnpaired {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RespondentCompound {
     pub stimuli: Vec<String>,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
