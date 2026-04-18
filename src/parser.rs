@@ -130,19 +130,17 @@ impl Parser {
             program_annotations.push(self.parse_annotation()?);
             self.skip_newlines();
         }
-        if self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
+        if self.at_any(&[
+            TokenType::Phase,
+            TokenType::Shaping,
+            TokenType::Progressive,
+        ]) {
             let seq = self.parse_phase_sequence(program_annotations)?;
             return Ok(TopLevel::PhaseSequence(seq));
         }
         if self.at(TokenType::Experiment) {
             let paper = self.parse_paper(program_annotations)?;
             return Ok(TopLevel::Paper(paper));
-        }
-        if self.at(TokenType::Progressive) {
-            return Err(DslError::parse(
-                "progressive blocks not yet supported by rs parser",
-                SourceSpan::new(self.peek().line, self.peek().col),
-            ));
         }
         let p = self.parse_program_body(program_annotations)?;
         Ok(TopLevel::Program(p))
@@ -319,11 +317,17 @@ impl Parser {
         program_annotations: Vec<Annotation>,
     ) -> Result<crate::experiment::PhaseSequence> {
         let mut phases: Vec<crate::experiment::Phase> = Vec::new();
-        while self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
+        while self.at_any(&[
+            TokenType::Phase,
+            TokenType::Shaping,
+            TokenType::Progressive,
+        ]) {
             if self.at(TokenType::Phase) {
                 phases.push(self.parse_phase_block()?);
-            } else {
+            } else if self.at(TokenType::Shaping) {
                 phases.extend(self.parse_shaping_block()?);
+            } else {
+                phases.extend(self.parse_progressive_block()?);
             }
             self.skip_newlines();
         }
@@ -345,6 +349,184 @@ impl Parser {
             phases,
             program_annotations,
         })
+    }
+
+    fn parse_progressive_block(&mut self) -> Result<Vec<crate::experiment::Phase>> {
+        self.expect(TokenType::Progressive, "progressive")?;
+        let label_tok = self.expect(TokenType::Identifier, "progressive label")?;
+        self.expect(TokenType::Colon, ": after progressive label")?;
+        self.skip_newlines();
+
+        // Collect steps lists (one or more `steps <ident> = [val, ...]` lines).
+        let mut step_maps: Vec<(String, Vec<f64>)> = Vec::new();
+        let mut user_criterion: Option<crate::experiment::Criterion> = None;
+        let mut min_sessions: Option<i64> = None;
+        loop {
+            self.skip_newlines();
+            if self.at(TokenType::Steps) {
+                self.advance();
+                let name_tok = self.expect(TokenType::Identifier, "steps variable name")?;
+                self.expect(TokenType::Equals, "= after steps name")?;
+                self.expect(TokenType::LBracket, "[ after steps =")?;
+                let mut vals = Vec::new();
+                if !self.at(TokenType::RBracket) {
+                    let n = self.expect(TokenType::Number, "steps value")?;
+                    vals.push(n.value.parse::<f64>().unwrap_or(0.0));
+                    while self.at(TokenType::Comma) {
+                        self.advance();
+                        let n = self.expect(TokenType::Number, "steps value")?;
+                        vals.push(n.value.parse::<f64>().unwrap_or(0.0));
+                    }
+                }
+                self.expect(TokenType::RBracket, "] on steps")?;
+                step_maps.push((name_tok.value, vals));
+                continue;
+            }
+            if self.at(TokenType::Sessions) {
+                self.advance();
+                if self.at(TokenType::Equals) {
+                    self.advance();
+                    // May be a placeholder or a concrete number.
+                    if self.at(TokenType::Number) {
+                        let nt = self.advance();
+                        user_criterion =
+                            Some(crate::experiment::Criterion::FixedSessions(
+                                crate::experiment::FixedSessions {
+                                    count: nt.value.parse().unwrap_or(0),
+                                },
+                            ));
+                    } else if self.at(TokenType::LBrace) {
+                        // Placeholder {ident} — currently skipped.
+                        while !self.at(TokenType::Newline) && !self.at(TokenType::Eof) {
+                            self.advance();
+                        }
+                    }
+                } else if self.at(TokenType::Gte) {
+                    self.advance();
+                    let nt = self.expect(TokenType::Number, "min sessions")?;
+                    let n: i64 = nt.value.parse().unwrap_or(0);
+                    min_sessions = Some(n);
+                }
+                continue;
+            }
+            if self.at(TokenType::Stable) {
+                self.advance();
+                self.expect(TokenType::LParen, "( after stable")?;
+                let method_tok = self.expect(TokenType::Identifier, "stability method")?;
+                let mut window_sessions: Option<i64> = None;
+                while self.at(TokenType::Comma) {
+                    self.advance();
+                    let key = self.expect(TokenType::Identifier, "stable kwarg")?;
+                    self.expect(TokenType::Equals, "=")?;
+                    match key.value.as_str() {
+                        "window" => {
+                            let nt = self.expect(TokenType::Number, "window")?;
+                            window_sessions = Some(nt.value.parse().unwrap_or(0));
+                        }
+                        _ => {
+                            let _ = self.advance();
+                        }
+                    }
+                }
+                self.expect(TokenType::RParen, ") on stable")?;
+                user_criterion = Some(crate::experiment::Criterion::Stability(
+                    crate::experiment::Stability {
+                        method: method_tok.value,
+                        window_sessions,
+                        max_change_pct: None,
+                        min_sessions,
+                        measure: None,
+                    },
+                ));
+                continue;
+            }
+            if self.at(TokenType::Advance) {
+                // `advance when criterion(...)` / `all(...)` / `manual`.
+                // Currently recorded in the AST via shared_annotations is not
+                // implemented; skip tokens until newline.
+                while !self.at(TokenType::Newline) && !self.at(TokenType::Eof) {
+                    self.advance();
+                }
+                continue;
+            }
+            break;
+        }
+        if user_criterion.is_none() {
+            if let Some(n) = min_sessions {
+                user_criterion = Some(crate::experiment::Criterion::Stability(
+                    crate::experiment::Stability {
+                        method: String::new(),
+                        window_sessions: None,
+                        max_change_pct: None,
+                        min_sessions: Some(n),
+                        measure: None,
+                    },
+                ));
+            }
+        }
+
+        // Capture the schedule template token range by scanning to the next
+        // top-level boundary (another top-level block keyword at column 1, or
+        // end of input). This avoids trying to parse a template containing
+        // unresolved Placeholder tokens.
+        let start = self.pos;
+        while self.pos < self.tokens.len() {
+            let t = &self.tokens[self.pos];
+            if t.ty == TokenType::Eof {
+                break;
+            }
+            if matches!(
+                t.ty,
+                TokenType::Phase
+                    | TokenType::Shaping
+                    | TokenType::Progressive
+                    | TokenType::Experiment
+            ) {
+                break;
+            }
+            self.pos += 1;
+        }
+        let end = self.pos;
+
+        // Use the first steps map as the expansion driver; py convention is
+        // that all steps lists are the same length and expand in lockstep.
+        let n = step_maps
+            .first()
+            .map(|(_, v)| v.len())
+            .unwrap_or(0);
+        let mut phases = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut tokens: Vec<Token> = self.tokens[start..end].to_vec();
+            for tok in tokens.iter_mut() {
+                if tok.ty == TokenType::Placeholder {
+                    if let Some((_, vals)) = step_maps.iter().find(|(k, _)| k == &tok.value) {
+                        if i < vals.len() {
+                            tok.ty = TokenType::Number;
+                            let v = vals[i];
+                            tok.value = if v.fract() == 0.0 {
+                                format!("{}", v as i64)
+                            } else {
+                                format!("{}", v)
+                            };
+                        }
+                    }
+                }
+            }
+            tokens.push(Token::new(TokenType::Eof, "", 0, 0));
+            let mut sub = Parser::new(tokens);
+            let schedule = sub.parse_schedule()?;
+            phases.push(crate::experiment::Phase {
+                label: format!("{}_{}", label_tok.value, i + 1),
+                schedule: crate::experiment::PhaseSchedule::Operant(schedule),
+                criterion: user_criterion.clone().unwrap_or(
+                    crate::experiment::Criterion::ExperimenterJudgment(
+                        crate::experiment::ExperimenterJudgment,
+                    ),
+                ),
+                annotations: Vec::new(),
+            });
+        }
+        Ok(phases)
     }
 
     fn parse_shaping_block(&mut self) -> Result<Vec<crate::experiment::Phase>> {
