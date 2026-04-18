@@ -308,6 +308,7 @@ impl Parser {
         })
     }
 
+
     fn parse_phase_sequence(
         &mut self,
         program_annotations: Vec<Annotation>,
@@ -2627,6 +2628,80 @@ fn canonical_annotation_keyword(kw: &str) -> Option<&'static str> {
         "hw" => Some("hardware"),
         "subject" => Some("subjects"),
         _ => None,
+    }
+}
+
+/// Expand `let`-bound `IdentifierRef` nodes, returning a Program with empty
+/// `bindings`. Matches the binding-expansion behaviour of
+/// `contingency_dsl.analyzer`. Unreferenced bindings are dropped; unresolved
+/// refs are left untouched so the emitted shape still shows the bug site.
+pub fn expand_bindings(program: Program) -> Program {
+    let env: BTreeMap<String, ScheduleExpr> = program
+        .bindings
+        .iter()
+        .map(|b| (b.name.clone(), b.value.clone()))
+        .collect();
+    let schedule = match program.schedule {
+        ProgramSchedule::Operant(expr) => ProgramSchedule::Operant(expand_schedule(expr, &env)),
+        other => other,
+    };
+    Program {
+        program_annotations: program.program_annotations,
+        param_decls: program.param_decls,
+        bindings: Vec::new(),
+        schedule,
+    }
+}
+
+fn expand_schedule(
+    expr: ScheduleExpr,
+    env: &BTreeMap<String, ScheduleExpr>,
+) -> ScheduleExpr {
+    match expr {
+        ScheduleExpr::IdentifierRef(r) => match env.get(&r.name) {
+            Some(replacement) => expand_schedule(replacement.clone(), env),
+            None => ScheduleExpr::IdentifierRef(r),
+        },
+        ScheduleExpr::Compound(mut c) => {
+            c.components = c
+                .components
+                .into_iter()
+                .map(|comp| expand_schedule(comp, env))
+                .collect();
+            ScheduleExpr::Compound(c)
+        }
+        ScheduleExpr::Modifier(mut m) => {
+            if let Some(inner) = m.inner.take() {
+                m.inner = Some(Box::new(expand_schedule(*inner, env)));
+            }
+            ScheduleExpr::Modifier(m)
+        }
+        ScheduleExpr::LimitedHold(mut lh) => {
+            lh.inner = Box::new(expand_schedule(*lh.inner, env));
+            ScheduleExpr::LimitedHold(lh)
+        }
+        ScheduleExpr::SecondOrder(mut so) => {
+            // SecondOrder overall/unit are Atomic — skip IdentifierRef
+            // resolution here (parser ensured Atomic type already).
+            let _ = &mut so;
+            ScheduleExpr::SecondOrder(so)
+        }
+        ScheduleExpr::TimeoutWrapped(mut tw) => {
+            tw.inner = Box::new(expand_schedule(*tw.inner, env));
+            ScheduleExpr::TimeoutWrapped(tw)
+        }
+        ScheduleExpr::ResponseCostWrapped(mut rw) => {
+            rw.inner = Box::new(expand_schedule(*rw.inner, env));
+            ScheduleExpr::ResponseCostWrapped(rw)
+        }
+        ScheduleExpr::Annotated(boxed) => {
+            let AnnotatedSchedule { expr, annotations } = *boxed;
+            ScheduleExpr::Annotated(Box::new(AnnotatedSchedule {
+                expr: expand_schedule(expr, env),
+                annotations,
+            }))
+        }
+        other => other,
     }
 }
 

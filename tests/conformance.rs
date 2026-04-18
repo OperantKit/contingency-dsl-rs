@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use contingency_dsl::ast::JsonValue as AstValue;
 use contingency_dsl::{
-    paper_to_json, parse_top_level, phase_sequence_to_json, program_to_json, TopLevel,
+    expand_bindings, paper_to_json, parse_top_level, phase_sequence_to_json, program_to_json,
+    TopLevel,
 };
 use serde_json::Value as JsonV;
 
@@ -172,7 +173,24 @@ fn conformance_coverage_report() {
                 TopLevel::Paper(p) => paper_to_json(p),
             };
             let got = ast_value_to_serde(&got_ast);
-            if json_subset(&got, &want) {
+            let mut matched = json_subset(&got, &want);
+            // If the primary match (pre_expansion if available, else
+            // expected) failed, try applying binding expansion and compare
+            // against the post-analysis `expected` shape. This lets
+            // fixtures that only carry `expected` (no pre_expansion) pass
+            // once binding expansion runs.
+            if !matched {
+                if let (TopLevel::Program(p), Some(expected_val)) =
+                    (&top, obj.get("expected"))
+                {
+                    let expanded = expand_bindings(p.clone());
+                    let got2 = ast_value_to_serde(&program_to_json(&expanded));
+                    if json_subset(&got2, expected_val) {
+                        matched = true;
+                    }
+                }
+            }
+            if matched {
                 stats.shape_match += 1;
                 passed += 1;
             } else {
