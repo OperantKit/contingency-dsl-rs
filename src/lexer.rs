@@ -212,7 +212,7 @@ fn tokenize_inner(source: &str, block: bool) -> Result<Vec<Token>> {
                 }
                 if col >= line.len() {
                     return Err(DslError::lex(
-                        "unterminated string literal",
+                        "UNTERMINATED_STRING: unterminated string literal",
                         SourceSpan::new(line_num, start_col + 1),
                     ));
                 }
@@ -356,7 +356,7 @@ fn tokenize_inner(source: &str, block: bool) -> Result<Vec<Token>> {
             }
 
             return Err(DslError::lex(
-                format!("unexpected character: '{}'", ch),
+                format!("UNEXPECTED_CHARACTER: '{}'", ch),
                 SourceSpan::new(line_num, col + 1),
             ));
         }

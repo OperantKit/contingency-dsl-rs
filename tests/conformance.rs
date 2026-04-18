@@ -167,7 +167,7 @@ fn conformance_coverage_report() {
                 stats.error_total += 1;
                 row.3 += 1;
                 let parse_result = parse_top_level(input);
-                let matched = match parse_result {
+                let matched = match &parse_result {
                     Err(e) => {
                         let kind_ok = etype.is_empty() || e.kind_str() == etype;
                         let code_ok = ecode
@@ -177,11 +177,9 @@ fn conformance_coverage_report() {
                         kind_ok && code_ok
                     }
                     Ok(top) => {
-                        // Parse succeeded; try analyzer-reported warnings
-                        // as a secondary channel (some fixtures tag
-                        // SemanticError codes that surface at the analyzer
-                        // pass, not parse).
-                        let diags = collect_diagnostics(&top);
+                        // Parse succeeded; some codes surface only at the
+                        // analyzer pass — check collected diagnostics.
+                        let diags = collect_diagnostics(top);
                         ecode
                             .as_deref()
                             .map(|want| diags.iter().any(|d| d == want))
@@ -191,6 +189,21 @@ fn conformance_coverage_report() {
                 if matched {
                     stats.error_match += 1;
                     row.2 += 1;
+                } else if let Some(JsonV::String(id)) = obj.get("id") {
+                    let code = ecode.as_deref().unwrap_or("?");
+                    let got = match &parse_result {
+                        Ok(_) => "Ok(parsed)".to_string(),
+                        Err(e) => format!(
+                            "{}:{:?}:{}",
+                            e.kind_str(),
+                            e.code(),
+                            e.to_string()
+                        ),
+                    };
+                    eprintln!(
+                        "  ERR MISS: {} :: {} :: want {}/{} got {}",
+                        rel, id, etype, code, got
+                    );
                 }
                 continue;
             }
@@ -284,10 +297,20 @@ fn conformance_coverage_report() {
 }
 
 fn normalize_error(obj: &serde_json::Map<String, JsonV>) -> Option<(String, Option<String>)> {
-    // Shorthand: "error": "ParseError" or { "type": "...", "code": "..." }.
+    // Shorthand:
+    //   "error": "ParseError"             → kind shorthand
+    //   "error": "MISSING_SIDMAN_PARAM"   → code shorthand
+    //   "error": { "type": "...", "code": "..." }
     if let Some(v) = obj.get("error") {
         match v {
-            JsonV::String(s) => return Some((s.clone(), None)),
+            JsonV::String(s) => {
+                let is_kind = matches!(s.as_str(), "ParseError" | "LexError" | "SemanticError");
+                if is_kind {
+                    return Some((s.clone(), None));
+                } else {
+                    return Some((String::new(), Some(s.clone())));
+                }
+            }
             JsonV::Object(m) => {
                 let etype = m
                     .get("type")
@@ -295,6 +318,12 @@ fn normalize_error(obj: &serde_json::Map<String, JsonV>) -> Option<(String, Opti
                     .unwrap_or("")
                     .to_string();
                 let ecode = m.get("code").and_then(|x| x.as_str()).map(str::to_string);
+                // If `type` doesn't look like a kind name, it is itself a
+                // code shorthand (fixtures like `{"type": "PCTL_INVALID_RANK"}`).
+                let kind_ok = matches!(etype.as_str(), "" | "ParseError" | "LexError" | "SemanticError");
+                if !kind_ok {
+                    return Some((String::new(), Some(etype)));
+                }
                 return Some((etype, ecode));
             }
             _ => {}

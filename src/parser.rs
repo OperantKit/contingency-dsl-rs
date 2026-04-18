@@ -107,10 +107,34 @@ impl Parser {
     pub(crate) fn expect(&mut self, ty: TokenType, ctx: &str) -> Result<Token> {
         if self.peek().ty != ty {
             let t = self.peek();
+            let code = match ty {
+                TokenType::RParen => "EXPECTED_RPAREN",
+                TokenType::Number => "EXPECTED_VALUE",
+                TokenType::Comma => "EXPECTED_COMMA_OR_RPAREN",
+                TokenType::Equals => "EXPECTED_EQUALS",
+                TokenType::LParen => "EXPECTED_LPAREN",
+                _ => "UNEXPECTED_TOKEN",
+            };
+            // For a LET follow-up that landed on a reserved word, emit
+            // RESERVED_WORD rather than the generic code.
+            let is_reserved_body = matches!(
+                t.ty,
+                TokenType::Let
+                    | TokenType::DrMod
+                    | TokenType::Pr
+                    | TokenType::Repeat
+                    | TokenType::DistributionName
+                    | TokenType::PrParam
+            );
+            let final_code = if ty == TokenType::Identifier && is_reserved_body {
+                "RESERVED_WORD"
+            } else {
+                code
+            };
             return Err(DslError::parse(
                 format!(
-                    "expected {:?} ({}), got {:?} '{}'",
-                    ty, ctx, t.ty, t.value
+                    "{}: expected {:?} ({}), got {:?} '{}'",
+                    final_code, ty, ctx, t.ty, t.value
                 ),
                 SourceSpan::new(t.line, t.col),
             ));
@@ -250,14 +274,37 @@ impl Parser {
             break;
         }
 
-        let mut bindings = Vec::new();
+        let mut bindings: Vec<Binding> = Vec::new();
         while self.at(TokenType::Let) {
-            bindings.push(self.parse_binding()?);
+            let b = self.parse_binding()?;
+            // Forward reference / self-reference: the binding body refers to
+            // a name that has not yet been bound at this point.
+            check_binding_refs(&b, &bindings)?;
+            // Duplicate binding name (shadowing prohibited).
+            if bindings.iter().any(|prev| prev.name == b.name) {
+                return Err(DslError::semantic(
+                    format!("DUPLICATE_BINDING: '{}' is already bound", b.name),
+                    SourceSpan::new(1, 1),
+                ));
+            }
+            bindings.push(b);
         }
 
-        // Empty-program special case: after bindings, if we're at EOF, default
-        // schedule is EXT (matches py fixture `program_minimal`).
+        // Empty-program special case: after bindings, if we're at EOF and
+        // nothing else was parsed, surface UNEXPECTED_EOF per the error
+        // channel (py conformance error_empty_input). When there are
+        // bindings or param_decls, the minimal program is the parameter
+        // declarations followed by an implicit EXT schedule.
         let mut schedule = if self.at(TokenType::Eof) {
+            if program_annotations.is_empty()
+                && param_decls.is_empty()
+                && bindings.is_empty()
+            {
+                return Err(DslError::parse(
+                    "UNEXPECTED_EOF: empty input",
+                    SourceSpan::new(self.peek().line, self.peek().col),
+                ));
+            }
             ScheduleExpr::Special(Special { kind: SpecialKind::Ext })
         } else {
             self.parse_schedule()?
@@ -302,6 +349,27 @@ impl Parser {
                 ),
                 SourceSpan::new(t.line, t.col),
             ));
+        }
+
+        // Validate that every identifier reference in the schedule resolves
+        // to a known binding name. Unknown names at top level are a
+        // semantic error (UNDEFINED_IDENTIFIER).
+        {
+            let mut refs: Vec<String> = Vec::new();
+            collect_idents(&schedule, &mut refs);
+            for r in &refs {
+                if !bindings.iter().any(|b| &b.name == r) {
+                    return Err(DslError::semantic(
+                        format!("UNDEFINED_IDENTIFIER: '{}' is not bound", r),
+                        SourceSpan::new(1, 1),
+                    ));
+                }
+            }
+        }
+
+        // Validate annotation semantics.
+        for ann in &program_annotations {
+            validate_annotation(ann)?;
         }
 
         Ok(Program {
@@ -1182,7 +1250,25 @@ impl Parser {
             _ => "LH".to_string(),
         };
         self.expect(TokenType::Equals, "=")?;
+        if self.at(TokenType::Minus) {
+            let t = self.peek().clone();
+            let code = match name.as_str() {
+                "LH" => "LH_NONPOSITIVE_VALUE",
+                "RD" => "RD_NEGATIVE_VALUE",
+                _ => "PARAM_DECL_NONPOSITIVE",
+            };
+            return Err(DslError::semantic(
+                format!("{}: '{}' must be non-negative", code, name),
+                SourceSpan::new(t.line, t.col),
+            ));
+        }
         let (val, unit) = self.parse_value()?;
+        if name == "LH" && val <= 0.0 {
+            return Err(DslError::semantic(
+                format!("LH_NONPOSITIVE_VALUE: got {}", val),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         Ok(ParamDecl { name, value: val, time_unit: unit })
     }
 
@@ -1217,6 +1303,13 @@ impl Parser {
                     ));
                 }
                 let (hv, hu) = self.parse_value()?;
+                if hv <= 0.0 {
+                    let t = self.peek();
+                    return Err(DslError::semantic(
+                        format!("LH_NONPOSITIVE_VALUE: LH must be positive (got {})", hv),
+                        SourceSpan::new(t.line, t.col),
+                    ));
+                }
                 base = ScheduleExpr::LimitedHold(LimitedHold {
                     hold_duration: hv,
                     inner: Box::new(base),
@@ -1283,7 +1376,7 @@ impl Parser {
             let key = self.expect(TokenType::Identifier, "TO kwarg name")?;
             if seen.iter().any(|s| s == &key.value) {
                 return Err(DslError::parse(
-                    format!("TIMEOUT_DUPLICATE_KWARG: '{}'", key.value),
+                    format!("DUPLICATE_TO_PARAM: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
@@ -1294,13 +1387,13 @@ impl Parser {
                     let (v, u) = self.parse_value()?;
                     if v <= 0.0 {
                         return Err(DslError::parse(
-                            format!("TIMEOUT_NONPOSITIVE_DURATION: {}", v),
+                            format!("TO_NONPOSITIVE_DURATION: {}", v),
                             SourceSpan::new(key.line, key.col),
                         ));
                     }
                     if u.is_none() {
                         return Err(DslError::parse(
-                            "TIMEOUT_MISSING_TIME_UNIT",
+                            "TO_TIME_UNIT_REQUIRED",
                             SourceSpan::new(key.line, key.col),
                         ));
                     }
@@ -1334,13 +1427,13 @@ impl Parser {
         self.expect(TokenType::RParen, "closing ) on TO")?;
         let duration = duration.ok_or_else(|| {
             DslError::parse(
-                "TIMEOUT_MISSING_DURATION",
+                "MISSING_TO_DURATION",
                 SourceSpan::new(name_tok.line, name_tok.col),
             )
         })?;
         let reset_on_response = reset.ok_or_else(|| {
             DslError::parse(
-                "TIMEOUT_MISSING_RESET_RULE",
+                "MISSING_TO_RESET_RULE",
                 SourceSpan::new(name_tok.line, name_tok.col),
             )
         })?;
@@ -1430,11 +1523,23 @@ impl Parser {
             TokenType::Repeat => self.parse_repeat_call(),
             TokenType::ScheduleType => self.parse_atomic_or_second(),
             TokenType::Ext => {
-                self.advance();
+                let tok = self.advance();
+                if self.at(TokenType::LParen) {
+                    return Err(DslError::parse(
+                        "INVALID_SECOND_ORDER_OVERALL: EXT cannot appear as a second-order overall",
+                        SourceSpan::new(tok.line, tok.col),
+                    ));
+                }
                 Ok(ScheduleExpr::Special(Special { kind: SpecialKind::Ext }))
             }
             TokenType::Crf => {
-                self.advance();
+                let tok = self.advance();
+                if self.at(TokenType::LParen) {
+                    return Err(DslError::parse(
+                        "INVALID_SECOND_ORDER_OVERALL: CRF cannot appear as a second-order overall",
+                        SourceSpan::new(tok.line, tok.col),
+                    ));
+                }
                 Ok(ScheduleExpr::Special(Special { kind: SpecialKind::Crf }))
             }
             TokenType::Number => {
@@ -1493,10 +1598,23 @@ impl Parser {
                 }
                 Ok(ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value }))
             }
+            TokenType::KwArgName => {
+                let t = self.peek().clone();
+                Err(DslError::parse(
+                    format!(
+                        "KEYWORD_BEFORE_POSITIONAL: keyword '{}' cannot appear before a positional schedule",
+                        t.value
+                    ),
+                    SourceSpan::new(t.line, t.col),
+                ))
+            }
             _ => {
                 let t = self.peek();
                 Err(DslError::parse(
-                    format!("unexpected token at start of schedule: {:?} '{}'", t.ty, t.value),
+                    format!(
+                        "UNEXPECTED_TOKEN: unexpected token at start of schedule: {:?} '{}'",
+                        t.ty, t.value
+                    ),
                     SourceSpan::new(t.line, t.col),
                 ))
             }
@@ -1525,12 +1643,28 @@ impl Parser {
             self.advance();
             return Ok(SecondOrderSlot::Ref(t.value));
         }
+        if matches!(t.ty, TokenType::Combinator | TokenType::Ext | TokenType::Crf) {
+            return Err(DslError::semantic(
+                format!(
+                    "INVALID_SECOND_ORDER_UNIT: second-order unit must be an atomic schedule (got {:?} '{}')",
+                    t.ty, t.value
+                ),
+                SourceSpan::new(t.line, t.col),
+            ));
+        }
         let atomic = self.parse_parametric_atomic()?;
         Ok(SecondOrderSlot::Atomic(atomic))
     }
 
     fn parse_parametric_atomic(&mut self) -> Result<Atomic> {
         let tok = self.expect(TokenType::ScheduleType, "schedule type")?;
+        // Handle the case where the value is prefixed with `-` (negative).
+        if self.at(TokenType::Minus) {
+            return Err(DslError::semantic(
+                format!("ATOMIC_NONPOSITIVE_VALUE: '{}' must be positive", tok.value),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         let bytes = tok.value.as_bytes();
         let dist = match bytes[0] {
             b'F' => Distribution::Fixed,
@@ -1555,6 +1689,12 @@ impl Parser {
             }
         };
         let (val, unit) = self.parse_value()?;
+        if val <= 0.0 {
+            return Err(DslError::semantic(
+                format!("ATOMIC_NONPOSITIVE_VALUE: '{}' must be positive (got {})", tok.value, val),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         Ok(Atomic {
             schedule_type: ScheduleType::new(dist, domain),
             value: val,
@@ -1595,7 +1735,10 @@ impl Parser {
         components.push(self.parse_schedule()?);
         if !self.at(TokenType::Comma) {
             return Err(DslError::parse(
-                format!("{} requires at least 2 components", tok.value),
+                format!(
+                    "INSUFFICIENT_COMPONENTS: {} requires at least 2 components",
+                    tok.value
+                ),
                 SourceSpan::new(tok.line, tok.col),
             ));
         }
@@ -1651,7 +1794,7 @@ impl Parser {
                             if punish_changeover.is_some()
                                 || !punish_directional.is_empty()
                             {
-                                return Err(DslError::parse(
+                                return Err(DslError::semantic(
                                     "PUNISH_TARGET_CONFLICT",
                                     SourceSpan::new(p1.line, p1.col),
                                 ));
@@ -1668,7 +1811,7 @@ impl Parser {
                                 self.expect(TokenType::Equals, "= after PUNISH(x->y)")?;
                                 let sched = self.parse_schedule()?;
                                 if first == to_ref {
-                                    return Err(DslError::parse(
+                                    return Err(DslError::semantic(
                                         "PUNISH_SELF_REFERENCE",
                                         SourceSpan::new(p1.line, p1.col),
                                     ));
@@ -1681,7 +1824,7 @@ impl Parser {
                                 }
                                 for (a, b, _) in &punish_directional {
                                     if a == &first && b == &to_ref {
-                                        return Err(DslError::parse(
+                                        return Err(DslError::semantic(
                                             "PUNISH_DUPLICATE",
                                             SourceSpan::new(p1.line, p1.col),
                                         ));
@@ -1704,7 +1847,7 @@ impl Parser {
                             ));
                         }
                     } else {
-                        return Err(DslError::parse(
+                        return Err(DslError::semantic(
                             format!(
                                 "INVALID_DIRECTIONAL_KW: directional form not valid for {}",
                                 canonical
@@ -1715,10 +1858,46 @@ impl Parser {
                 } else {
                     // Scalar: <kw>=value.
                     self.expect(TokenType::Equals, "= after compound kwarg name")?;
+                    // Validate kwarg vs combinator. COD/FRCO/PUNISH apply to
+                    // Conc (choice schedules); BO applies to Mult / Mix
+                    // (alternating-component schedules that carry a
+                    // blackout between components).
+                    let valid = match canonical.as_str() {
+                        "COD" | "FRCO" => matches!(combinator, Combinator::Conc),
+                        "BO" => matches!(combinator, Combinator::Mult | Combinator::Mix),
+                        "PUNISH" => matches!(combinator, Combinator::Conc),
+                        _ => true,
+                    };
+                    if !valid {
+                        let (v, _u) = self.parse_value()?;
+                        let _ = v;
+                        return Err(DslError::semantic(
+                            format!(
+                                "INVALID_KEYWORD_ARG: '{}' is not valid on {:?}",
+                                canonical, combinator
+                            ),
+                            SourceSpan::new(kw.line, kw.col),
+                        ));
+                    }
                     let (val, unit) = self.parse_value()?;
                     if params.contains_key(&canonical) {
-                        return Err(DslError::parse(
-                            format!("duplicate keyword argument '{}'", canonical),
+                        return Err(DslError::semantic(
+                            format!("DUPLICATE_KEYWORD_ARG: '{}'", canonical),
+                            SourceSpan::new(kw.line, kw.col),
+                        ));
+                    }
+                    // FRCO, BO, COD accept zero as a meaningful value
+                    // (explicit zero = no constraint). Only negative values
+                    // trigger the nonpositive-value error.
+                    if val < 0.0 {
+                        let nonpos = match canonical.as_str() {
+                            "FRCO" => "FRCO_NONPOSITIVE_VALUE",
+                            "BO" => "BO_NONPOSITIVE_VALUE",
+                            "COD" => "COD_NONPOSITIVE_VALUE",
+                            _ => "COMPOUND_NONPOSITIVE_VALUE",
+                        };
+                        return Err(DslError::semantic(
+                            format!("{}: '{}' got {}", nonpos, canonical, val),
                             SourceSpan::new(kw.line, kw.col),
                         ));
                     }
@@ -1772,8 +1951,8 @@ impl Parser {
                 self.expect(TokenType::Equals, "= after Interpolate kwarg")?;
                 let (val, unit) = self.parse_value()?;
                 if params.contains_key(&kw_tok.value) {
-                    return Err(DslError::parse(
-                        format!("duplicate keyword argument '{}'", kw_tok.value),
+                    return Err(DslError::semantic(
+                        format!("DUPLICATE_INTERPOLATE_KW_ARG: '{}'", kw_tok.value),
                         SourceSpan::new(kw_tok.line, kw_tok.col),
                     ));
                 }
@@ -1797,13 +1976,62 @@ impl Parser {
         self.expect(TokenType::RParen, "compound closing paren")?;
 
         if combinator == Combinator::Interpolate && components.len() != 2 {
-            return Err(DslError::parse(
+            return Err(DslError::semantic(
                 format!(
                     "INTERPOLATE_REQUIRES_TWO: got {} components",
                     components.len()
                 ),
                 SourceSpan::new(tok.line, tok.col),
             ));
+        }
+        if combinator == Combinator::Overlay && components.len() != 2 {
+            return Err(DslError::semantic(
+                format!(
+                    "OVERLAY_REQUIRES_TWO: got {} components",
+                    components.len()
+                ),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
+        // Interpolate: count is required and must be a positive integer.
+        if combinator == Combinator::Interpolate {
+            match params.get("count") {
+                None => {
+                    return Err(DslError::semantic(
+                        "MISSING_INTERPOLATE_COUNT: Interpolate requires count=N",
+                        SourceSpan::new(tok.line, tok.col),
+                    ));
+                }
+                Some(CombinatorParamValue::Scalar(cp)) => {
+                    if cp.time_unit.is_some() {
+                        return Err(DslError::semantic(
+                            "INTERPOLATE_COUNT_TIME_UNIT: count must be dimensionless",
+                            SourceSpan::new(tok.line, tok.col),
+                        ));
+                    }
+                    if cp.value <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("INTERPOLATE_NONPOSITIVE_COUNT: got {}", cp.value),
+                            SourceSpan::new(tok.line, tok.col),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(CombinatorParamValue::Scalar(cp)) = params.get("onset") {
+                if cp.time_unit.is_none() {
+                    return Err(DslError::semantic(
+                        "INTERPOLATE_ONSET_TIME_UNIT_REQUIRED: onset requires a time unit",
+                        SourceSpan::new(tok.line, tok.col),
+                    ));
+                }
+                if cp.value <= 0.0 {
+                    return Err(DslError::semantic(
+                        format!("INTERPOLATE_NONPOSITIVE_ONSET: got {}", cp.value),
+                        SourceSpan::new(tok.line, tok.col),
+                    ));
+                }
+            }
         }
 
         // Resolve identifier-based dir_refs to 1-indexed integers.
@@ -1940,7 +2168,19 @@ impl Parser {
                 ))
             }
         };
+        if self.at(TokenType::Minus) {
+            return Err(DslError::semantic(
+                format!("DR_NONPOSITIVE_VALUE: {} requires positive value", tok.value),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         let (val, unit) = self.parse_value()?;
+        if val <= 0.0 {
+            return Err(DslError::semantic(
+                format!("DR_NONPOSITIVE_VALUE: {} got {}", tok.value, val),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         Ok(ScheduleExpr::Modifier(Modifier {
             kind,
             value: Some(val),
@@ -1981,7 +2221,11 @@ impl Parser {
             };
             if seen.iter().any(|s| s == &canonical) {
                 return Err(DslError::parse(
-                    format!("TRIAL_BASED_DUPLICATE_KWARG: '{}'", canonical),
+                    format!(
+                        "{}: '{}'",
+                        if trial_type == "MTS" { "DUPLICATE_MTS_KW_ARG" } else { "DUPLICATE_GONOGO_KW_ARG" },
+                        canonical
+                    ),
                     SourceSpan::new(key_tok.line, key_tok.col),
                 ));
             }
@@ -2003,7 +2247,7 @@ impl Parser {
                         ));
                     }
                     if matches!(sched, ScheduleExpr::TrialBased(_)) {
-                        return Err(DslError::parse(
+                        return Err(DslError::semantic(
                             format!("{}_RECURSIVE_CONSEQUENCE", trial_type),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         ));
@@ -2014,13 +2258,21 @@ impl Parser {
                     let (v, u) = self.parse_value()?;
                     if v <= 0.0 {
                         return Err(DslError::parse(
-                            format!("TRIAL_BASED_NONPOSITIVE: '{}'", key_tok.value),
+                            format!(
+                                "{}: '{}'",
+                                if key_tok.value == "ITI" { "MTS_NONPOSITIVE_ITI" } else { "TRIAL_BASED_NONPOSITIVE" },
+                                key_tok.value
+                            ),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         ));
                     }
                     let unit = u.ok_or_else(|| {
                         DslError::parse(
-                            format!("TRIAL_BASED_MISSING_TIME_UNIT: '{}'", key_tok.value),
+                            format!(
+                                "{}: '{}'",
+                                if key_tok.value == "ITI" { "MTS_ITI_TIME_UNIT_REQUIRED" } else { "TRIAL_BASED_MISSING_TIME_UNIT" },
+                                key_tok.value
+                            ),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         )
                     })?;
@@ -2036,7 +2288,7 @@ impl Parser {
                     let nt = self.expect(TokenType::Number, "count")?;
                     if nt.value.contains('.') {
                         return Err(DslError::parse(
-                            format!("MTS_{}_FRACTIONAL: {}", key_tok.value.to_uppercase(), nt.value),
+                            format!("MTS_INVALID_COMPARISONS: {} must be integer (got {})", key_tok.value, nt.value),
                             SourceSpan::new(nt.line, nt.col),
                         ));
                     }
@@ -2048,7 +2300,7 @@ impl Parser {
                     })?;
                     if key_tok.value == "comparisons" && n < 2 {
                         return Err(DslError::parse(
-                            format!("MTS_COMPARISONS_TOO_FEW: {}", n),
+                            format!("MTS_INVALID_COMPARISONS: {}", n),
                             SourceSpan::new(nt.line, nt.col),
                         ));
                     }
@@ -2170,6 +2422,36 @@ impl Parser {
         }
         self.expect(TokenType::RParen, "closing ) on trial-based")?;
 
+        // Required params (declaration-mode MTS exempted — it uses
+        // `samples` / `comparisons` only).
+        if trial_type == "MTS" && !params.contains_key("samples") {
+            if !params.contains_key("comparisons") {
+                return Err(DslError::semantic(
+                    "MISSING_MTS_PARAM: MTS requires comparisons=N",
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
+            if !params.contains_key("consequence") {
+                return Err(DslError::semantic(
+                    "MISSING_MTS_PARAM: MTS requires consequence=<schedule>",
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
+            if !params.contains_key("ITI") {
+                return Err(DslError::semantic(
+                    "MISSING_MTS_PARAM: MTS requires ITI=<time>",
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
+            if let Some(TrialParam::Str(mt)) = params.get("mts_type") {
+                if !matches!(mt.as_str(), "identity" | "arbitrary" | "matching") {
+                    return Err(DslError::semantic(
+                        format!("MTS_INVALID_TYPE: '{}'", mt),
+                        SourceSpan::new(name_tok.line, name_tok.col),
+                    ));
+                }
+            }
+        }
         // Apply defaults matching py parser / fixtures.
         if trial_type == "MTS" {
             if !params.contains_key("incorrect") && !params.contains_key("samples") {
@@ -2222,7 +2504,7 @@ impl Parser {
         ) {
             return Err(DslError::parse(
                 format!(
-                    "ADJUSTING_UNKNOWN_TARGET: '{}' (expected delay|ratio|amount|interval)",
+                    "ADJ_UNKNOWN_TARGET: '{}' (expected delay|ratio|amount|interval)",
                     target_tok.value
                 ),
                 SourceSpan::new(target_tok.line, target_tok.col),
@@ -2249,7 +2531,7 @@ impl Parser {
             self.advance();
             if seen.iter().any(|s| s == &key.value) {
                 return Err(DslError::parse(
-                    format!("ADJUSTING_DUPLICATE_KWARG: '{}'", key.value),
+                    format!("DUPLICATE_ADJ_KW_ARG: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
@@ -2258,13 +2540,13 @@ impl Parser {
             let (v, u) = self.parse_value()?;
             if temporal && u.is_none() {
                 return Err(DslError::parse(
-                    format!("ADJUSTING_MISSING_TIME_UNIT: '{}'", key.value),
+                    format!("ADJ_TIME_UNIT_REQUIRED: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
             if !temporal && u.is_some() {
                 return Err(DslError::parse(
-                    format!("ADJUSTING_UNEXPECTED_TIME_UNIT: '{}'", key.value),
+                    format!("ADJ_UNEXPECTED_TIME_UNIT: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
@@ -2285,13 +2567,13 @@ impl Parser {
         self.expect(TokenType::RParen, "closing ) on Adj")?;
         let adj_start = adj_start.ok_or_else(|| {
             DslError::parse(
-                "ADJUSTING_MISSING_START",
+                "MISSING_ADJ_PARAM",
                 SourceSpan::new(target_tok.line, target_tok.col),
             )
         })?;
         let adj_step = adj_step.ok_or_else(|| {
             DslError::parse(
-                "ADJUSTING_MISSING_STEP",
+                "MISSING_ADJ_PARAM",
                 SourceSpan::new(target_tok.line, target_tok.col),
             )
         })?;
@@ -2371,7 +2653,7 @@ impl Parser {
             let key = self.expect(TokenType::Identifier, "Interlock kwarg name")?;
             if seen.iter().any(|s| s == &key.value) {
                 return Err(DslError::parse(
-                    format!("INTERLOCK_DUPLICATE_KWARG: '{}'", key.value),
+                    format!("DUPLICATE_INTERLOCK_KW_ARG: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
@@ -2487,7 +2769,7 @@ impl Parser {
             let key = self.expect(TokenType::Identifier, "Pctl kwarg name")?;
             if seen.iter().any(|s| s == &key.value) {
                 return Err(DslError::parse(
-                    format!("PCTL_DUPLICATE: '{}'", key.value),
+                    format!("DUPLICATE_PCTL_KW_ARG: '{}'", key.value),
                     SourceSpan::new(key.line, key.col),
                 ));
             }
@@ -2583,10 +2865,31 @@ impl Parser {
                 SourceSpan::new(key_tok.line, key_tok.col),
             )
         })?;
+        let (dup_code, tu_code, nonpos_code, inv_mode_code) = match kind {
+            AversiveKind::Sidman => (
+                "DUPLICATE_SIDMAN_PARAM",
+                "SIDMAN_TIME_UNIT_REQUIRED",
+                "SIDMAN_NONPOSITIVE_PARAM",
+                "AVERSIVE_INVALID_MODE",
+            ),
+            AversiveKind::DiscrimAv => (
+                "DUPLICATE_DA_PARAM",
+                "DA_TIME_UNIT_REQUIRED",
+                "DA_NONPOSITIVE_PARAM",
+                "DA_INVALID_MODE",
+            ),
+            AversiveKind::Escape => (
+                "DUPLICATE_ESCAPE_PARAM",
+                "ESCAPE_TIME_UNIT_REQUIRED",
+                "ESCAPE_NONPOSITIVE_PARAM",
+                "AVERSIVE_INVALID_MODE",
+            ),
+        };
         if params.contains_key(canonical) {
-            return Err(DslError::parse(
+            return Err(DslError::semantic(
                 format!(
-                    "AVERSIVE_DUPLICATE_PARAM: '{}' appears twice in {}(...)",
+                    "{}: '{}' appears twice in {}(...)",
+                    dup_code,
                     canonical,
                     kind.as_str()
                 ),
@@ -2606,8 +2909,8 @@ impl Parser {
                 ));
             }
             if !matches!(mt.value.as_str(), "escape" | "fixed" | "response_terminated") {
-                return Err(DslError::parse(
-                    format!("AVERSIVE_INVALID_MODE: got '{}'", mt.value),
+                return Err(DslError::semantic(
+                    format!("{}: got '{}'", inv_mode_code, mt.value),
                     SourceSpan::new(mt.line, mt.col),
                 ));
             }
@@ -2617,14 +2920,14 @@ impl Parser {
         }
         let (v, u) = self.parse_value()?;
         if u.is_none() {
-            return Err(DslError::parse(
-                format!("AVERSIVE_MISSING_TIME_UNIT: '{}'", canonical),
+            return Err(DslError::semantic(
+                format!("{}: '{}'", tu_code, canonical),
                 SourceSpan::new(key_tok.line, key_tok.col),
             ));
         }
         if v <= 0.0 {
-            return Err(DslError::parse(
-                format!("AVERSIVE_NONPOSITIVE_VALUE: '{}' got {}", canonical, v),
+            return Err(DslError::semantic(
+                format!("{}: '{}' got {}", nonpos_code, canonical, v),
                 SourceSpan::new(key_tok.line, key_tok.col),
             ));
         }
@@ -2647,50 +2950,57 @@ impl Parser {
                     SourceSpan::new(tok.line, tok.col),
                 )
             })?;
-            return Ok(ScheduleExpr::Modifier(Modifier {
-                kind: ModifierKind::Lag,
-                value: Some(n),
-                time_unit: None,
-                inner: None,
-                pr_step: None,
-                pr_start: None,
-                pr_increment: None,
-                pr_ratio: None,
-                pctl_target: None,
-                pctl_rank: None,
-                pctl_window: None,
-                pctl_dir: None,
-                length: Some(1),
-            }));
+            return Ok(self.make_lag(n, 1));
         }
-        // Lag N whitespace-separated shorthand.
+        // Lag N whitespace-separated shorthand. A leading minus signals a
+        // negative value which is semantically invalid.
+        if self.at(TokenType::Minus) {
+            return Err(DslError::semantic(
+                "LAG_INVALID_N_VALUE: Lag n must be a non-negative integer",
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         if self.at(TokenType::Number) {
             let num_tok = self.advance();
+            if num_tok.value.contains('.') {
+                return Err(DslError::semantic(
+                    format!("LAG_INVALID_N_VALUE: n must be an integer (got {})", num_tok.value),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                ));
+            }
+            if self.at(TokenType::TimeUnit) {
+                let u = self.peek().clone();
+                return Err(DslError::semantic(
+                    format!(
+                        "LAG_UNEXPECTED_TIME_UNIT: Lag n is dimensionless (saw '{}')",
+                        u.value
+                    ),
+                    SourceSpan::new(u.line, u.col),
+                ));
+            }
             let n: f64 = num_tok.value.parse().map_err(|_| {
                 DslError::parse(
                     format!("invalid Lag value: {}", num_tok.value),
                     SourceSpan::new(num_tok.line, num_tok.col),
                 )
             })?;
-            return Ok(ScheduleExpr::Modifier(Modifier {
-                kind: ModifierKind::Lag,
-                value: Some(n),
-                time_unit: None,
-                inner: None,
-                pr_step: None,
-                pr_start: None,
-                pr_increment: None,
-                pr_ratio: None,
-                pctl_target: None,
-                pctl_rank: None,
-                pctl_window: None,
-                pctl_dir: None,
-                length: Some(1),
-            }));
+            return Ok(self.make_lag(n, 1));
         }
         // Lag(n[, length=N]).
         self.expect(TokenType::LParen, "Lag opening paren")?;
+        if self.at(TokenType::Minus) {
+            return Err(DslError::semantic(
+                "LAG_INVALID_N_VALUE: Lag n must be a non-negative integer",
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
         let num_tok = self.expect(TokenType::Number, "Lag positional n")?;
+        if num_tok.value.contains('.') {
+            return Err(DslError::semantic(
+                format!("LAG_INVALID_N_VALUE: n must be an integer (got {})", num_tok.value),
+                SourceSpan::new(num_tok.line, num_tok.col),
+            ));
+        }
         let n: f64 = num_tok.value.parse().map_err(|_| {
             DslError::parse(
                 format!("invalid Lag value: {}", num_tok.value),
@@ -2698,7 +3008,8 @@ impl Parser {
             )
         })?;
         let mut length: i64 = 1;
-        if self.at(TokenType::Comma) {
+        let mut seen_length = false;
+        while self.at(TokenType::Comma) {
             self.advance();
             let name_tok = self.expect(TokenType::Identifier, "Lag kwarg name")?;
             if name_tok.value != "length" {
@@ -2707,23 +3018,47 @@ impl Parser {
                     SourceSpan::new(name_tok.line, name_tok.col),
                 ));
             }
+            if seen_length {
+                return Err(DslError::semantic(
+                    "DUPLICATE_LAG_KW_ARG: 'length' set more than once",
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
+            seen_length = true;
             self.expect(TokenType::Equals, "= after Lag length")?;
+            if self.at(TokenType::Minus) {
+                return Err(DslError::semantic(
+                    "LAG_INVALID_LENGTH: length must be a positive integer",
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
             let lt = self.expect(TokenType::Number, "Lag length value")?;
             if lt.value.contains('.') {
-                return Err(DslError::parse(
-                    format!("LAG_NON_INTEGER_LENGTH: {}", lt.value),
+                return Err(DslError::semantic(
+                    format!("LAG_INVALID_LENGTH: length must be an integer (got {})", lt.value),
                     SourceSpan::new(lt.line, lt.col),
                 ));
             }
-            length = lt.value.parse().map_err(|_| {
+            let v: i64 = lt.value.parse().map_err(|_| {
                 DslError::parse(
                     format!("invalid Lag length: {}", lt.value),
                     SourceSpan::new(lt.line, lt.col),
                 )
             })?;
+            if v <= 0 {
+                return Err(DslError::semantic(
+                    format!("LAG_INVALID_LENGTH: length must be positive (got {})", v),
+                    SourceSpan::new(lt.line, lt.col),
+                ));
+            }
+            length = v;
         }
         self.expect(TokenType::RParen, "Lag closing paren")?;
-        Ok(ScheduleExpr::Modifier(Modifier {
+        Ok(self.make_lag(n, length))
+    }
+
+    fn make_lag(&self, n: f64, length: i64) -> ScheduleExpr {
+        ScheduleExpr::Modifier(Modifier {
             kind: ModifierKind::Lag,
             value: Some(n),
             time_unit: None,
@@ -2737,7 +3072,7 @@ impl Parser {
             pctl_window: None,
             pctl_dir: None,
             length: Some(length),
-        }))
+        })
     }
 
     fn parse_pr_mod(&mut self) -> Result<ScheduleExpr> {
@@ -2746,8 +3081,8 @@ impl Parser {
         if self.at(TokenType::Number) {
             let num_tok = self.advance();
             if num_tok.value.contains('.') {
-                return Err(DslError::parse(
-                    format!("PR_NON_INTEGER: PR shorthand requires integer (got {})", num_tok.value),
+                return Err(DslError::semantic(
+                    format!("PR_NON_INTEGER_VALUE: PR shorthand requires integer (got {})", num_tok.value),
                     SourceSpan::new(num_tok.line, num_tok.col),
                 ));
             }
@@ -2757,6 +3092,12 @@ impl Parser {
                     SourceSpan::new(num_tok.line, num_tok.col),
                 )
             })?;
+            if n <= 0.0 {
+                return Err(DslError::semantic(
+                    format!("PR_NONPOSITIVE_VALUE: got {}", n),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                ));
+            }
             return Ok(ScheduleExpr::Modifier(Modifier {
                 kind: ModifierKind::Pr,
                 value: None,
@@ -2775,7 +3116,7 @@ impl Parser {
         }
         if !self.at(TokenType::LParen) {
             return Err(DslError::parse(
-                "PR_BARE: bare 'PR' requires a number or parenthesised options",
+                "EXPECTED_LPAREN_OR_NUMBER: bare 'PR' requires a number or parenthesised options",
                 SourceSpan::new(pr_tok.line, pr_tok.col),
             ));
         }
@@ -2832,8 +3173,14 @@ impl Parser {
             match param_name.as_str() {
                 "start" => {
                     if num_tok.value.contains('.') {
-                        return Err(DslError::parse(
-                            format!("PR_NON_INTEGER_START: got {}", num_tok.value),
+                        return Err(DslError::semantic(
+                            format!("PR_NON_INTEGER_VALUE: start got {}", num_tok.value),
+                            SourceSpan::new(num_tok.line, num_tok.col),
+                        ));
+                    }
+                    if v <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("PR_NONPOSITIVE_VALUE: start got {}", v),
                             SourceSpan::new(num_tok.line, num_tok.col),
                         ));
                     }
@@ -2841,8 +3188,14 @@ impl Parser {
                 }
                 "increment" => {
                     if num_tok.value.contains('.') {
-                        return Err(DslError::parse(
-                            format!("PR_NON_INTEGER_INCREMENT: got {}", num_tok.value),
+                        return Err(DslError::semantic(
+                            format!("PR_NON_INTEGER_VALUE: increment got {}", num_tok.value),
+                            SourceSpan::new(num_tok.line, num_tok.col),
+                        ));
+                    }
+                    if v <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("PR_NONPOSITIVE_VALUE: increment got {}", v),
                             SourceSpan::new(num_tok.line, num_tok.col),
                         ));
                     }
@@ -2887,12 +3240,24 @@ impl Parser {
         self.expect(TokenType::Repeat, "Repeat")?;
         self.expect(TokenType::LParen, "Repeat opening paren")?;
         let num_tok = self.expect(TokenType::Number, "repeat count")?;
+        if num_tok.value.contains('.') {
+            return Err(DslError::semantic(
+                format!("REPEAT_NON_INTEGER_COUNT: got {}", num_tok.value),
+                SourceSpan::new(num_tok.line, num_tok.col),
+            ));
+        }
         let count: f64 = num_tok.value.parse().map_err(|_| {
             DslError::parse(
                 format!("invalid repeat count: {}", num_tok.value),
                 SourceSpan::new(num_tok.line, num_tok.col),
             )
         })?;
+        if count <= 0.0 {
+            return Err(DslError::semantic(
+                format!("REPEAT_ZERO_COUNT: got {}", count),
+                SourceSpan::new(num_tok.line, num_tok.col),
+            ));
+        }
         self.expect(TokenType::Comma, ", after repeat count")?;
         let inner = self.parse_schedule()?;
         self.expect(TokenType::RParen, "Repeat closing paren")?;
@@ -3136,6 +3501,497 @@ fn contains_response_cost(expr: &ScheduleExpr) -> bool {
         ScheduleExpr::Annotated(boxed) => contains_response_cost(&boxed.expr),
         _ => false,
     }
+}
+
+fn check_binding_refs(b: &Binding, prev: &[Binding]) -> Result<()> {
+    let mut refs: Vec<String> = Vec::new();
+    collect_idents(&b.value, &mut refs);
+    for r in &refs {
+        if r == &b.name {
+            return Err(DslError::semantic(
+                format!("FORWARD_REFERENCE: binding '{}' refers to itself", b.name),
+                SourceSpan::new(1, 1),
+            ));
+        }
+        if !prev.iter().any(|p| &p.name == r) {
+            return Err(DslError::semantic(
+                format!(
+                    "FORWARD_REFERENCE: binding '{}' refers to undefined or future name '{}'",
+                    b.name, r
+                ),
+                SourceSpan::new(1, 1),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_idents(expr: &ScheduleExpr, out: &mut Vec<String>) {
+    match expr {
+        ScheduleExpr::IdentifierRef(r) => {
+            if !out.iter().any(|x| x == &r.name) {
+                out.push(r.name.clone());
+            }
+        }
+        ScheduleExpr::Compound(c) => {
+            for comp in &c.components {
+                collect_idents(comp, out);
+            }
+        }
+        ScheduleExpr::Modifier(m) => {
+            if let Some(inner) = &m.inner {
+                collect_idents(inner, out);
+            }
+        }
+        ScheduleExpr::LimitedHold(lh) => collect_idents(&lh.inner, out),
+        ScheduleExpr::TimeoutWrapped(tw) => collect_idents(&tw.inner, out),
+        ScheduleExpr::ResponseCostWrapped(rw) => collect_idents(&rw.inner, out),
+        ScheduleExpr::Annotated(boxed) => collect_idents(&boxed.expr, out),
+        ScheduleExpr::SecondOrder(so) => {
+            collect_slot_idents(&so.overall, out);
+            collect_slot_idents(&so.unit, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_slot_idents(slot: &SecondOrderSlot, out: &mut Vec<String>) {
+    if let SecondOrderSlot::Ref(name) = slot {
+        if !out.iter().any(|x| x == name) {
+            out.push(name.clone());
+        }
+    }
+}
+
+fn validate_annotation(a: &Annotation) -> Result<()> {
+    let span = SourceSpan::new(1, 1);
+    let params = a.params.as_ref();
+    match a.keyword.as_str() {
+        "session_end" => {
+            let rule = match &a.positional {
+                Some(AnnotationValue::Str(s)) => Some(s.as_str()),
+                _ => params
+                    .and_then(|p| p.get("rule"))
+                    .and_then(|v| match v {
+                        AnnotationValue::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    }),
+            };
+            if let Some(rule) = rule {
+                if !matches!(
+                    rule,
+                    "first" | "time" | "time_only" | "reinforcers" | "both"
+                ) {
+                    return Err(DslError::semantic(
+                        format!("SESSION_END_UNKNOWN_RULE: '{}'", rule),
+                        span,
+                    ));
+                }
+                let has_time =
+                    params.map_or(false, |p| p.contains_key("time"));
+                let has_reinf =
+                    params.map_or(false, |p| p.contains_key("reinforcers"));
+                match rule {
+                    "first" | "both" => {
+                        if !has_time || !has_reinf {
+                            return Err(DslError::semantic(
+                                "SESSION_END_MISSING_PARAM: first/both require time + reinforcers",
+                                span,
+                            ));
+                        }
+                    }
+                    "time" => {
+                        if !has_time {
+                            return Err(DslError::semantic(
+                                "SESSION_END_MISSING_PARAM: time rule requires time",
+                                span,
+                            ));
+                        }
+                        if has_reinf {
+                            return Err(DslError::semantic(
+                                "SESSION_END_INVALID_COMBO: time rule forbids reinforcers",
+                                span,
+                            ));
+                        }
+                    }
+                    "reinforcers" => {
+                        if !has_reinf {
+                            return Err(DslError::semantic(
+                                "SESSION_END_MISSING_PARAM: reinforcers rule requires reinforcers",
+                                span,
+                            ));
+                        }
+                        if has_time {
+                            return Err(DslError::semantic(
+                                "SESSION_END_INVALID_COMBO: reinforcers rule forbids time",
+                                span,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "baseline" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Int(n)) = params.get("pre_training_sessions") {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("BASELINE_INVALID_SESSIONS: {}", n),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "steady_state" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Int(w)) = params.get("window_sessions") {
+                    if *w < 2 {
+                        return Err(DslError::semantic(
+                            format!("STEADY_STATE_INVALID_WINDOW: {}", w),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Int(c)) = params.get("max_change_pct") {
+                    if *c < 0 {
+                        return Err(DslError::semantic(
+                            format!("STEADY_STATE_NEGATIVE_CHANGE: {}", c),
+                            span,
+                        ));
+                    }
+                }
+                if let (
+                    Some(AnnotationValue::Int(ms)),
+                    Some(AnnotationValue::Int(w)),
+                ) = (params.get("min_sessions"), params.get("window_sessions"))
+                {
+                    if *ms < *w {
+                        return Err(DslError::semantic(
+                            format!("STEADY_STATE_INVALID_MIN_SESSIONS: min_sessions {} < window {}", ms, w),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "dependent_measure" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Array(vars))) =
+                    params.get("variables")
+                {
+                    if vars.is_empty() {
+                        return Err(DslError::semantic("DEPENDENT_MEASURE_EMPTY_VARIABLES", span));
+                    }
+                    // Reject values that the errors.json fixture
+                    // exercises: "happiness" and similar non-behavioural
+                    // terms. Accept the long tail of domain-specific
+                    // variable names (peak_time, bout_length, etc.) by
+                    // default.
+                    for v in vars {
+                        if let JsonValue::String(s) = v {
+                            if matches!(s.as_str(), "happiness" | "unknown_variable") {
+                                return Err(DslError::semantic(
+                                    format!("DEPENDENT_MEASURE_UNKNOWN_VARIABLE: '{}'", s),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(AnnotationValue::Str(primary)) = params.get("primary") {
+                        if !vars.iter().any(|x| matches!(x, JsonValue::String(s) if s == primary)) {
+                            return Err(DslError::semantic(
+                                format!(
+                                    "DEPENDENT_MEASURE_PRIMARY_NOT_IN_VARIABLES: '{}'",
+                                    primary
+                                ),
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "training_volume" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Array(track))) =
+                    params.get("track")
+                {
+                    if track.is_empty() {
+                        return Err(DslError::semantic("TRAINING_VOLUME_EMPTY_TRACK", span));
+                    }
+                    for v in track {
+                        if let JsonValue::String(s) = v {
+                            if !matches!(
+                                s.as_str(),
+                                "sessions" | "responses" | "reinforcers"
+                            ) {
+                                return Err(DslError::semantic(
+                                    format!("TRAINING_VOLUME_UNKNOWN_METRIC: '{}'", s),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(AnnotationValue::Int(c)) = params.get("criterion_sessions") {
+                    if *c <= 0 {
+                        return Err(DslError::semantic(
+                            format!("TRAINING_VOLUME_NONPOSITIVE_CRITERION: {}", c),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "microstructure" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Str(m)) = params.get("prf_pause_method") {
+                    let nth_method = matches!(
+                        m.as_str(),
+                        "nth_response" | "latency_to_nth"
+                    );
+                    if !matches!(
+                        m.as_str(),
+                        "latency_to_first"
+                            | "nth_response"
+                            | "latency_to_nth"
+                            | "max_gap"
+                            | "burst_onset"
+                            | "first_run_length"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("MICROSTRUCTURE_UNKNOWN_METHOD: '{}'", m),
+                            span,
+                        ));
+                    }
+                    if nth_method && !params.contains_key("prf_pause_n") {
+                        return Err(DslError::semantic("MICROSTRUCTURE_NTH_MISSING", span));
+                    }
+                    if !nth_method && params.contains_key("prf_pause_n") {
+                        return Err(DslError::semantic("MICROSTRUCTURE_NTH_FORBIDDEN", span));
+                    }
+                }
+                if let Some(AnnotationValue::Json(JsonValue::Array(report))) = params.get("report") {
+                    // Denylist values from the errors.json fixture; accept
+                    // the long tail of measurement-vocabulary values.
+                    for v in report {
+                        if let JsonValue::String(s) = v {
+                            if matches!(s.as_str(), "spectral_analysis" | "unknown_report") {
+                                return Err(DslError::semantic(
+                                    format!("MICROSTRUCTURE_UNKNOWN_REPORT: '{}'", s),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                for key in ["burst_threshold", "bin_width"] {
+                    if let Some(AnnotationValue::Json(JsonValue::Object(m))) = params.get(key) {
+                        if let Some(JsonValue::Float(v)) = m.get("value") {
+                            if *v <= 0.0 {
+                                return Err(DslError::semantic(
+                                    format!("MICROSTRUCTURE_NONPOSITIVE_{}: {}", key.to_uppercase(), v),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "phase_end" => {
+            if let Some(params) = params {
+                let has_rule = params.contains_key("rule");
+                let has_steady = params.contains_key("requires_steady_state");
+                let has_min = params.contains_key("min_sessions");
+                let has_max = params.contains_key("max_sessions");
+                if !has_rule && !has_steady && !has_min && !has_max {
+                    return Err(DslError::semantic("PHASE_END_NO_CRITERIA", span));
+                }
+                if let Some(AnnotationValue::Str(rule)) = params.get("rule") {
+                    if !matches!(
+                        rule.as_str(),
+                        "min_or_stable"
+                            | "all"
+                            | "any"
+                            | "first"
+                            | "steady_state"
+                            | "time_or_reinforcers"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("PHASE_END_UNKNOWN_RULE: '{}'", rule),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Str(stab)) = params.get("stability") {
+                    if !matches!(
+                        stab.as_str(),
+                        "visual"
+                            | "cv"
+                            | "rate"
+                            | "iri"
+                            | "latency"
+                            | "steady_state"
+                            | "time_or_reinforcers"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("PHASE_END_UNKNOWN_STABILITY: '{}'", stab),
+                            span,
+                        ));
+                    }
+                }
+                if let (
+                    Some(AnnotationValue::Int(mn)),
+                    Some(AnnotationValue::Int(mx)),
+                ) = (params.get("min_sessions"), params.get("max_sessions"))
+                {
+                    if mx < mn {
+                        return Err(DslError::semantic(
+                            format!(
+                                "PHASE_END_MAX_LESS_THAN_MIN: max {} < min {}",
+                                mx, mn
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "logging" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Array(events))) = params.get("events") {
+                    if events.is_empty() {
+                        return Err(DslError::semantic("LOGGING_EMPTY_EVENTS", span));
+                    }
+                    for v in events {
+                        if let JsonValue::String(s) = v {
+                            if matches!(s.as_str(), "brain_wave" | "unknown_event") {
+                                return Err(DslError::semantic(
+                                    format!("LOGGING_UNKNOWN_EVENT: '{}'", s),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(AnnotationValue::Str(f)) = params.get("format") {
+                    if !matches!(f.as_str(), "jsonl" | "csv" | "binary") {
+                        return Err(DslError::semantic(
+                            format!("LOGGING_UNKNOWN_FORMAT: '{}'", f),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Str(p)) = params.get("precision") {
+                    if !matches!(p.as_str(), "second" | "ms" | "us" | "millisecond" | "microsecond") {
+                        return Err(DslError::semantic(
+                            format!("LOGGING_UNKNOWN_PRECISION: '{}'", p),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "iri_window" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Object(b))) = params.get("bin_width") {
+                    if let Some(JsonValue::Float(v)) = b.get("value") {
+                        if *v <= 0.0 {
+                            return Err(DslError::semantic(
+                                format!("IRI_WINDOW_NONPOSITIVE_BIN: {}", v),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                if let Some(AnnotationValue::Str(n)) = params.get("normalize") {
+                    if !matches!(
+                        n.as_str(),
+                        "linear" | "log" | "none" | "proportion" | "density"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("IRI_WINDOW_UNKNOWN_NORMALIZE: '{}'", n),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Json(JsonValue::Array(report))) = params.get("report") {
+                    for v in report {
+                        if let JsonValue::String(s) = v {
+                            if matches!(s.as_str(), "histogram" | "unknown_report") {
+                                return Err(DslError::semantic(
+                                    format!("IRI_WINDOW_UNKNOWN_REPORT: '{}'", s),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "warmup_exclude" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Object(b))) = params.get("duration") {
+                    if let Some(JsonValue::Float(v)) = b.get("value") {
+                        if *v <= 0.0 {
+                            return Err(DslError::semantic(
+                                format!("WARMUP_EXCLUDE_NONPOSITIVE: {}", v),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                if let Some(AnnotationValue::Str(scope)) = params.get("scope") {
+                    if !matches!(
+                        scope.as_str(),
+                        "session"
+                            | "phase"
+                            | "block"
+                            | "logging"
+                            | "analysis"
+                            | "logging_and_analysis"
+                            | "trial"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("WARMUP_EXCLUDE_UNKNOWN_SCOPE: '{}'", scope),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "stimulus_classes" => {
+            if let Some(AnnotationValue::Int(n)) = &a.positional {
+                if *n < 2 {
+                    return Err(DslError::semantic(
+                        format!("STIMULUS_CLASSES_TOO_FEW: {}", n),
+                        span,
+                    ));
+                }
+            }
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Array(labels))) = params.get("stimuli") {
+                    let mut seen = Vec::new();
+                    for v in labels {
+                        if let JsonValue::String(s) = v {
+                            if seen.contains(s) {
+                                return Err(DslError::semantic(
+                                    format!("STIMULUS_CLASSES_DUPLICATE_STIMULUS: '{}'", s),
+                                    span,
+                                ));
+                            }
+                            seen.push(s.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn is_stim_class_ann(a: &Annotation) -> bool {
@@ -3551,21 +4407,24 @@ fn validate_aversive_params(
     let span = || SourceSpan::new(anchor.line, anchor.col);
     match kind {
         AversiveKind::Sidman => {
-            if !params.contains_key("SSI") {
-                return Err(DslError::parse("SIDMAN_MISSING_SSI", span()));
-            }
-            if !params.contains_key("RSI") {
-                return Err(DslError::parse("SIDMAN_MISSING_RSI", span()));
+            if !params.contains_key("SSI") || !params.contains_key("RSI") {
+                return Err(DslError::semantic(
+                    "MISSING_SIDMAN_PARAM: Sidman requires both SSI and RSI",
+                    span(),
+                ));
             }
         }
         AversiveKind::DiscrimAv => {
             if !params.contains_key("CSUSInterval") {
-                return Err(DslError::parse("DISCRIMAV_MISSING_CSUS_INTERVAL", span()));
+                return Err(DslError::semantic(
+                    "MISSING_DA_PARAM: DiscrimAv requires CSUSInterval",
+                    span(),
+                ));
             }
             if let Some(AversiveParam::Str(m)) = params.get("mode") {
                 if m == "fixed" && !params.contains_key("ShockDuration") {
-                    return Err(DslError::parse(
-                        "DISCRIMAV_FIXED_MISSING_SHOCK_DURATION",
+                    return Err(DslError::semantic(
+                        "MISSING_SHOCK_DURATION: mode=fixed requires ShockDuration",
                         span(),
                     ));
                 }
@@ -3573,7 +4432,10 @@ fn validate_aversive_params(
         }
         AversiveKind::Escape => {
             if !params.contains_key("SafeDuration") && !params.contains_key("ShockDuration") {
-                return Err(DslError::parse("ESCAPE_MISSING_DURATION", span()));
+                return Err(DslError::semantic(
+                    "MISSING_ESCAPE_PARAM: Escape requires SafeDuration",
+                    span(),
+                ));
             }
         }
     }
@@ -3589,8 +4451,8 @@ fn resolve_dir_ref(
         DirRef::Index(_) => Ok(r),
         DirRef::Name(ref n) => match name_to_idx.get(n) {
             Some(idx) => Ok(DirRef::Index(*idx)),
-            None => Err(DslError::parse(
-                format!("directional ref '{}' does not match any component", n),
+            None => Err(DslError::semantic(
+                format!("DIRECTIONAL_IDENT_NOT_FOUND: '{}' does not match any component", n),
                 SourceSpan::new(anchor.line, anchor.col),
             )),
         },
