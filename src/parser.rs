@@ -29,7 +29,7 @@ use crate::ast::{
     IdentifierRef, InterlockingSchedule, JsonValue, LimitedHold, Modifier, ModifierKind,
     NumericPayload, ParamDecl, Program, ProgramSchedule, PunishParam, ResponseCost,
     ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder, Special, SpecialKind, Timeout,
-    TimeoutWrapped,
+    TimeoutWrapped, TrialBased, TrialParam,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -454,6 +454,9 @@ impl Parser {
                 }
                 if next_is_lparen && peek_val == "Pctl" {
                     return self.parse_pctl_schedule();
+                }
+                if next_is_lparen && (peek_val == "MTS" || peek_val == "GoNoGo") {
+                    return self.parse_trial_based();
                 }
                 let tok = self.advance();
                 let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
@@ -952,6 +955,191 @@ impl Parser {
             pctl_window: None,
             pctl_dir: None,
             length: None,
+        }))
+    }
+
+    fn parse_trial_based(&mut self) -> Result<ScheduleExpr> {
+        let name_tok = self.expect(TokenType::Identifier, "trial-based schedule name")?;
+        let trial_type = name_tok.value.clone();
+        self.expect(TokenType::LParen, "( after trial-based name")?;
+        let mut params: BTreeMap<String, TrialParam> = BTreeMap::new();
+        let mut seen: Vec<String> = Vec::new();
+        while !self.at(TokenType::RParen) {
+            let head = self.peek().clone();
+            let (key_tok, key_is_lh) = if head.ty == TokenType::Lh {
+                self.advance();
+                (head.clone(), true)
+            } else {
+                (self.expect(TokenType::Identifier, "kwarg name")?, false)
+            };
+            let canonical = if key_tok.value == "type" {
+                "mts_type".to_string()
+            } else if key_is_lh {
+                "LH".to_string()
+            } else {
+                key_tok.value.clone()
+            };
+            if seen.iter().any(|s| s == &canonical) {
+                return Err(DslError::parse(
+                    format!("TRIAL_BASED_DUPLICATE_KWARG: '{}'", canonical),
+                    SourceSpan::new(key_tok.line, key_tok.col),
+                ));
+            }
+            seen.push(canonical.clone());
+            self.expect(TokenType::Equals, "= after trial-based kwarg")?;
+            match key_tok.value.as_str() {
+                "consequence" | "incorrect" | "falseAlarm" => {
+                    let sched = self.parse_schedule()?;
+                    if matches!(sched, ScheduleExpr::Compound(_))
+                        && matches!(key_tok.value.as_str(), "consequence" | "incorrect")
+                    {
+                        let prefix = if trial_type == "MTS" { "MTS" } else { "GONOGO" };
+                        return Err(DslError::parse(
+                            format!(
+                                "{}_INVALID_CONSEQUENCE: '{}' must not be compound",
+                                prefix, key_tok.value
+                            ),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
+                    if matches!(sched, ScheduleExpr::TrialBased(_)) {
+                        return Err(DslError::parse(
+                            format!("{}_RECURSIVE_CONSEQUENCE", trial_type),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
+                    params.insert(key_tok.value.clone(), TrialParam::Schedule(Box::new(sched)));
+                }
+                "ITI" | "responseWindow" => {
+                    let (v, u) = self.parse_value()?;
+                    if v <= 0.0 {
+                        return Err(DslError::parse(
+                            format!("TRIAL_BASED_NONPOSITIVE: '{}'", key_tok.value),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
+                    let unit = u.ok_or_else(|| {
+                        DslError::parse(
+                            format!("TRIAL_BASED_MISSING_TIME_UNIT: '{}'", key_tok.value),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        )
+                    })?;
+                    params.insert(key_tok.value.clone(), TrialParam::Float(v));
+                    let unit_key = if key_tok.value == "ITI" {
+                        "ITI_unit".to_string()
+                    } else {
+                        "responseWindowUnit".to_string()
+                    };
+                    params.insert(unit_key, TrialParam::Str(unit));
+                }
+                "comparisons" | "samples" => {
+                    let nt = self.expect(TokenType::Number, "count")?;
+                    if nt.value.contains('.') {
+                        return Err(DslError::parse(
+                            format!("MTS_{}_FRACTIONAL: {}", key_tok.value.to_uppercase(), nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    let n: i64 = nt.value.parse().map_err(|_| {
+                        DslError::parse(
+                            format!("invalid {}: {}", key_tok.value, nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        )
+                    })?;
+                    if key_tok.value == "comparisons" && n < 2 {
+                        return Err(DslError::parse(
+                            format!("MTS_COMPARISONS_TOO_FEW: {}", n),
+                            SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    params.insert(key_tok.value.clone(), TrialParam::Int(n));
+                }
+                "mts_type" | "type" => {
+                    let vt = self.expect(TokenType::Identifier, "mts type value")?;
+                    params.insert("mts_type".into(), TrialParam::Str(vt.value));
+                }
+                "delay" => {
+                    let (v, u) = self.parse_value()?;
+                    if v < 0.0 {
+                        return Err(DslError::parse(
+                            "TRIAL_BASED_NEGATIVE_DELAY",
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
+                    let unit = u.ok_or_else(|| {
+                        DslError::parse(
+                            "MTS_DELAY_TIME_UNIT_REQUIRED",
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        )
+                    })?;
+                    params.insert("delay".into(), TrialParam::Float(v));
+                    params.insert("delay_unit".into(), TrialParam::Str(unit));
+                }
+                _ if key_is_lh || canonical == "LH" => {
+                    let (v, u) = self.parse_value()?;
+                    if v <= 0.0 {
+                        return Err(DslError::parse(
+                            "TRIAL_BASED_NONPOSITIVE_LH",
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
+                    let unit = u.ok_or_else(|| {
+                        DslError::parse(
+                            "TRIAL_BASED_LH_MISSING_UNIT",
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        )
+                    })?;
+                    params.insert("limitedHold".into(), TrialParam::Float(v));
+                    params.insert("limitedHoldUnit".into(), TrialParam::Str(unit));
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown trial-based kwarg '{}'", key_tok.value),
+                        SourceSpan::new(key_tok.line, key_tok.col),
+                    ))
+                }
+            }
+            if self.at(TokenType::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on trial-based")?;
+
+        // Apply defaults matching py parser / fixtures.
+        if trial_type == "MTS" {
+            if !params.contains_key("incorrect") && !params.contains_key("samples") {
+                params.insert(
+                    "incorrect".into(),
+                    TrialParam::Schedule(Box::new(ScheduleExpr::Special(Special {
+                        kind: SpecialKind::Ext,
+                    }))),
+                );
+            }
+            if !params.contains_key("mts_type") && !params.contains_key("samples") {
+                params.insert("mts_type".into(), TrialParam::Str("arbitrary".into()));
+            }
+        } else if trial_type == "GoNoGo" {
+            if !params.contains_key("incorrect") {
+                params.insert(
+                    "incorrect".into(),
+                    TrialParam::Schedule(Box::new(ScheduleExpr::Special(Special {
+                        kind: SpecialKind::Ext,
+                    }))),
+                );
+            }
+            if !params.contains_key("falseAlarm") {
+                params.insert(
+                    "falseAlarm".into(),
+                    TrialParam::Schedule(Box::new(ScheduleExpr::Special(Special {
+                        kind: SpecialKind::Ext,
+                    }))),
+                );
+            }
+        }
+
+        Ok(ScheduleExpr::TrialBased(TrialBased {
+            trial_type,
+            params,
         }))
     }
 
