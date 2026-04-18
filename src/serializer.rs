@@ -547,12 +547,18 @@ fn adjusting_to_json(a: &AdjustingSchedule) -> JsonValue {
     m.insert("adj_target".into(), JsonValue::String(a.adj_target.clone()));
     m.insert("adj_start".into(), numeric_payload_to_json(&a.adj_start));
     m.insert("adj_step".into(), numeric_payload_to_json(&a.adj_step));
-    if let Some(v) = &a.adj_min {
-        m.insert("adj_min".into(), numeric_payload_to_json(v));
-    }
-    if let Some(v) = &a.adj_max {
-        m.insert("adj_max".into(), numeric_payload_to_json(v));
-    }
+    m.insert(
+        "adj_min".into(),
+        a.adj_min
+            .as_ref()
+            .map_or(JsonValue::Null, numeric_payload_to_json),
+    );
+    m.insert(
+        "adj_max".into(),
+        a.adj_max
+            .as_ref()
+            .map_or(JsonValue::Null, numeric_payload_to_json),
+    );
     JsonValue::Object(m)
 }
 
@@ -567,9 +573,12 @@ fn interlocking_to_json(il: &InterlockingSchedule) -> JsonValue {
 fn numeric_payload_to_json(n: &NumericPayload) -> JsonValue {
     let mut m = BTreeMap::new();
     m.insert("value".into(), JsonValue::Float(n.value));
-    if let Some(u) = &n.time_unit {
-        m.insert("time_unit".into(), JsonValue::String(u.clone()));
-    }
+    m.insert(
+        "time_unit".into(),
+        n.time_unit
+            .as_ref()
+            .map_or(JsonValue::Null, |u| JsonValue::String(u.clone())),
+    );
     JsonValue::Object(m)
 }
 

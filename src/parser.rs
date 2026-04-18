@@ -24,11 +24,12 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Atomic, AversiveKind, AversiveParam, AversiveSchedule, Binding, CombinatorParamValue, Compound,
-    CompoundParam, DirRef, DirectionalCOD, DirectionalEntry, IdentifierRef, JsonValue, LimitedHold,
-    Modifier, ModifierKind, NumericPayload, ParamDecl, Program, ProgramSchedule, PunishParam,
-    ResponseCost, ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder, Special,
-    SpecialKind, Timeout, TimeoutWrapped,
+    AdjustingSchedule, Atomic, AversiveKind, AversiveParam, AversiveSchedule, Binding,
+    CombinatorParamValue, Compound, CompoundParam, DirRef, DirectionalCOD, DirectionalEntry,
+    IdentifierRef, InterlockingSchedule, JsonValue, LimitedHold, Modifier, ModifierKind,
+    NumericPayload, ParamDecl, Program, ProgramSchedule, PunishParam, ResponseCost,
+    ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder, Special, SpecialKind, Timeout,
+    TimeoutWrapped,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -442,6 +443,17 @@ impl Parser {
                 // Aversive schedule calls: Sidman(...), DiscrimAv(...), Escape(...)
                 if next_is_lparen && aversive_kind(&peek_val).is_some() {
                     return self.parse_aversive_schedule();
+                }
+                if next_is_lparen && (peek_val == "Adj" || peek_val == "Adjusting") {
+                    return self.parse_adjusting_schedule();
+                }
+                if next_is_lparen
+                    && (peek_val == "Interlock" || peek_val == "Interlocking")
+                {
+                    return self.parse_interlocking_schedule();
+                }
+                if next_is_lparen && peek_val == "Pctl" {
+                    return self.parse_pctl_schedule();
                 }
                 let tok = self.advance();
                 let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
@@ -939,6 +951,340 @@ impl Parser {
             pctl_rank: None,
             pctl_window: None,
             pctl_dir: None,
+            length: None,
+        }))
+    }
+
+    fn parse_adjusting_schedule(&mut self) -> Result<ScheduleExpr> {
+        let _name = self.advance();
+        self.expect(TokenType::LParen, "( after Adj")?;
+        let target_tok = self.expect(TokenType::Identifier, "Adj target")?;
+        if !matches!(
+            target_tok.value.as_str(),
+            "delay" | "ratio" | "amount" | "interval"
+        ) {
+            return Err(DslError::parse(
+                format!(
+                    "ADJUSTING_UNKNOWN_TARGET: '{}' (expected delay|ratio|amount|interval)",
+                    target_tok.value
+                ),
+                SourceSpan::new(target_tok.line, target_tok.col),
+            ));
+        }
+        let temporal = matches!(target_tok.value.as_str(), "delay" | "interval");
+        let mut adj_start: Option<NumericPayload> = None;
+        let mut adj_step: Option<NumericPayload> = None;
+        let mut adj_min: Option<NumericPayload> = None;
+        let mut adj_max: Option<NumericPayload> = None;
+        let mut seen: Vec<String> = Vec::new();
+        while self.at(TokenType::Comma) {
+            self.advance();
+            let key = self.peek().clone();
+            if !matches!(key.ty, TokenType::Identifier | TokenType::PrParam) {
+                return Err(DslError::parse(
+                    format!(
+                        "expected Adj kwarg name, got {:?} '{}'",
+                        key.ty, key.value
+                    ),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            self.advance();
+            if seen.iter().any(|s| s == &key.value) {
+                return Err(DslError::parse(
+                    format!("ADJUSTING_DUPLICATE_KWARG: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            seen.push(key.value.clone());
+            self.expect(TokenType::Equals, "= after Adj kwarg")?;
+            let (v, u) = self.parse_value()?;
+            if temporal && u.is_none() {
+                return Err(DslError::parse(
+                    format!("ADJUSTING_MISSING_TIME_UNIT: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            if !temporal && u.is_some() {
+                return Err(DslError::parse(
+                    format!("ADJUSTING_UNEXPECTED_TIME_UNIT: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            let payload = NumericPayload { value: v, time_unit: u };
+            match key.value.as_str() {
+                "start" => adj_start = Some(payload),
+                "step" => adj_step = Some(payload),
+                "min" => adj_min = Some(payload),
+                "max" => adj_max = Some(payload),
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown Adj kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on Adj")?;
+        let adj_start = adj_start.ok_or_else(|| {
+            DslError::parse(
+                "ADJUSTING_MISSING_START",
+                SourceSpan::new(target_tok.line, target_tok.col),
+            )
+        })?;
+        let adj_step = adj_step.ok_or_else(|| {
+            DslError::parse(
+                "ADJUSTING_MISSING_STEP",
+                SourceSpan::new(target_tok.line, target_tok.col),
+            )
+        })?;
+        // Semantic validation.
+        if target_tok.value == "ratio" {
+            if adj_start.value.fract() != 0.0 {
+                return Err(DslError::parse(
+                    format!("ADJ_RATIO_NOT_INTEGER: start {}", adj_start.value),
+                    SourceSpan::new(target_tok.line, target_tok.col),
+                ));
+            }
+            if adj_step.value.fract() != 0.0 {
+                return Err(DslError::parse(
+                    format!("ADJ_RATIO_NOT_INTEGER: step {}", adj_step.value),
+                    SourceSpan::new(target_tok.line, target_tok.col),
+                ));
+            }
+        }
+        if adj_start.value <= 0.0 {
+            return Err(DslError::parse(
+                format!("ADJ_NONPOSITIVE_START: {}", adj_start.value),
+                SourceSpan::new(target_tok.line, target_tok.col),
+            ));
+        }
+        if adj_step.value <= 0.0 {
+            return Err(DslError::parse(
+                format!("ADJ_NONPOSITIVE_STEP: {}", adj_step.value),
+                SourceSpan::new(target_tok.line, target_tok.col),
+            ));
+        }
+        if let (Some(mn), Some(mx)) = (&adj_min, &adj_max) {
+            if mn.value >= mx.value {
+                return Err(DslError::parse(
+                    format!("ADJ_INVALID_BOUNDS: min={} max={}", mn.value, mx.value),
+                    SourceSpan::new(target_tok.line, target_tok.col),
+                ));
+            }
+        }
+        if let Some(mn) = &adj_min {
+            if adj_start.value < mn.value {
+                return Err(DslError::parse(
+                    format!(
+                        "ADJ_START_OUT_OF_BOUNDS: start={} min={}",
+                        adj_start.value, mn.value
+                    ),
+                    SourceSpan::new(target_tok.line, target_tok.col),
+                ));
+            }
+        }
+        if let Some(mx) = &adj_max {
+            if adj_start.value > mx.value {
+                return Err(DslError::parse(
+                    format!(
+                        "ADJ_START_OUT_OF_BOUNDS: start={} max={}",
+                        adj_start.value, mx.value
+                    ),
+                    SourceSpan::new(target_tok.line, target_tok.col),
+                ));
+            }
+        }
+        Ok(ScheduleExpr::AdjustingSchedule(AdjustingSchedule {
+            adj_target: target_tok.value,
+            adj_start,
+            adj_step,
+            adj_min,
+            adj_max,
+        }))
+    }
+
+    fn parse_interlocking_schedule(&mut self) -> Result<ScheduleExpr> {
+        let name_tok = self.advance();
+        self.expect(TokenType::LParen, "( after Interlock")?;
+        let mut r0: Option<i64> = None;
+        let mut t_value: Option<NumericPayload> = None;
+        let mut seen: Vec<String> = Vec::new();
+        while !self.at(TokenType::RParen) {
+            let key = self.expect(TokenType::Identifier, "Interlock kwarg name")?;
+            if seen.iter().any(|s| s == &key.value) {
+                return Err(DslError::parse(
+                    format!("INTERLOCK_DUPLICATE_KWARG: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            seen.push(key.value.clone());
+            self.expect(TokenType::Equals, "= after Interlock kwarg")?;
+            match key.value.as_str() {
+                "R0" => {
+                    let nt = self.expect(TokenType::Number, "R0 value")?;
+                    if nt.value.contains('.') {
+                        return Err(DslError::parse(
+                            format!("INTERLOCK_INVALID_R0: {}", nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    let n: i64 = nt.value.parse().map_err(|_| {
+                        DslError::parse(
+                            format!("invalid R0: {}", nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        )
+                    })?;
+                    if n <= 0 {
+                        return Err(DslError::parse(
+                            format!("INTERLOCK_NONPOSITIVE_R0: {}", n),
+                            SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    r0 = Some(n);
+                }
+                "T" => {
+                    let (v, u) = self.parse_value()?;
+                    if u.is_none() {
+                        return Err(DslError::parse(
+                            "INTERLOCK_MISSING_TIME_UNIT",
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
+                    if v <= 0.0 {
+                        return Err(DslError::parse(
+                            format!("INTERLOCK_NONPOSITIVE_T: {}", v),
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
+                    t_value = Some(NumericPayload { value: v, time_unit: u });
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown Interlock kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+            if self.at(TokenType::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on Interlock")?;
+        let r0 = r0.ok_or_else(|| {
+            DslError::parse(
+                "INTERLOCK_MISSING_R0",
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        let t_value = t_value.ok_or_else(|| {
+            DslError::parse(
+                "INTERLOCK_MISSING_T",
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        Ok(ScheduleExpr::InterlockingSchedule(InterlockingSchedule {
+            interlock_r0: r0,
+            interlock_t: t_value,
+        }))
+    }
+
+    fn parse_pctl_schedule(&mut self) -> Result<ScheduleExpr> {
+        self.advance(); // Pctl
+        self.expect(TokenType::LParen, "( after Pctl")?;
+        let target_tok = self.expect(TokenType::Identifier, "Pctl target")?;
+        const KNOWN: &[&str] = &[
+            "force", "latency", "duration", "IRT", "rate", "location", "amplitude",
+        ];
+        if !KNOWN.iter().any(|k| *k == target_tok.value) {
+            return Err(DslError::parse(
+                format!("PCTL_UNKNOWN_TARGET: '{}'", target_tok.value),
+                SourceSpan::new(target_tok.line, target_tok.col),
+            ));
+        }
+        self.expect(TokenType::Comma, ", after Pctl target")?;
+        let rank_tok = self.expect(TokenType::Number, "Pctl rank")?;
+        if rank_tok.value.contains('.') {
+            return Err(DslError::parse(
+                format!("PCTL_INVALID_RANK: {}", rank_tok.value),
+                SourceSpan::new(rank_tok.line, rank_tok.col),
+            ));
+        }
+        let rank: i64 = rank_tok.value.parse().map_err(|_| {
+            DslError::parse(
+                format!("invalid rank: {}", rank_tok.value),
+                SourceSpan::new(rank_tok.line, rank_tok.col),
+            )
+        })?;
+        if !(0..=100).contains(&rank) {
+            return Err(DslError::parse(
+                format!("PCTL_INVALID_RANK: {}", rank),
+                SourceSpan::new(rank_tok.line, rank_tok.col),
+            ));
+        }
+        let mut window: Option<i64> = None;
+        let mut direction: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        while self.at(TokenType::Comma) {
+            self.advance();
+            let key = self.expect(TokenType::Identifier, "Pctl kwarg name")?;
+            if seen.iter().any(|s| s == &key.value) {
+                return Err(DslError::parse(
+                    format!("PCTL_DUPLICATE: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            seen.push(key.value.clone());
+            self.expect(TokenType::Equals, "= after Pctl kwarg")?;
+            match key.value.as_str() {
+                "window" => {
+                    let nt = self.expect(TokenType::Number, "window value")?;
+                    let w: i64 = nt.value.parse().map_err(|_| {
+                        DslError::parse(
+                            format!("invalid window: {}", nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        )
+                    })?;
+                    if w <= 0 {
+                        return Err(DslError::parse(
+                            format!("PCTL_INVALID_WINDOW: {}", w),
+                            SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    window = Some(w);
+                }
+                "dir" => {
+                    let v = self.expect(TokenType::Identifier, "dir value")?;
+                    if !matches!(v.value.as_str(), "below" | "above") {
+                        return Err(DslError::parse(
+                            format!("Pctl dir must be below/above: '{}'", v.value),
+                            SourceSpan::new(v.line, v.col),
+                        ));
+                    }
+                    direction = Some(v.value);
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown Pctl kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on Pctl")?;
+        Ok(ScheduleExpr::Modifier(Modifier {
+            kind: ModifierKind::Pctl,
+            value: None,
+            time_unit: None,
+            inner: None,
+            pr_step: None,
+            pr_start: None,
+            pr_increment: None,
+            pr_ratio: None,
+            pctl_target: Some(target_tok.value),
+            pctl_rank: Some(rank),
+            pctl_window: Some(window.unwrap_or(20)),
+            pctl_dir: Some(direction.unwrap_or_else(|| "below".into())),
             length: None,
         }))
     }
