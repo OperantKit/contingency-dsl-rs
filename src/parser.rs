@@ -232,7 +232,7 @@ impl Parser {
 
     fn parse_program_body(
         &mut self,
-        program_annotations: Vec<Annotation>,
+        mut program_annotations: Vec<Annotation>,
     ) -> Result<Program> {
 
         let mut param_decls = Vec::new();
@@ -253,11 +253,41 @@ impl Parser {
 
         // Empty-program special case: after bindings, if we're at EOF, default
         // schedule is EXT (matches py fixture `program_minimal`).
-        let schedule = if self.at(TokenType::Eof) {
+        let mut schedule = if self.at(TokenType::Eof) {
             ScheduleExpr::Special(Special { kind: SpecialKind::Ext })
         } else {
             self.parse_schedule()?
         };
+
+        // Route schedule-scoped annotations from program_annotations onto
+        // the schedule itself. Matches py `_route_schedule_annotations`.
+        let decl_mode_mts = is_declaration_mode_mts(&schedule);
+        let (mut routed, retained): (Vec<Annotation>, Vec<Annotation>) = program_annotations
+            .into_iter()
+            .partition(|a| {
+                a.keyword == "trial_mix"
+                    || a.keyword == "probe_policy"
+                    || (decl_mode_mts
+                        && matches!(a.keyword.as_str(), "training" | "testing"))
+            });
+        program_annotations = retained;
+        if !routed.is_empty() {
+            schedule = match schedule {
+                ScheduleExpr::Annotated(boxed) => {
+                    let AnnotatedSchedule { expr, mut annotations } = *boxed;
+                    let mut v = std::mem::take(&mut routed);
+                    v.append(&mut annotations);
+                    ScheduleExpr::Annotated(Box::new(AnnotatedSchedule {
+                        expr,
+                        annotations: v,
+                    }))
+                }
+                other => ScheduleExpr::Annotated(Box::new(AnnotatedSchedule {
+                    expr: other,
+                    annotations: routed,
+                })),
+            };
+        }
 
         self.skip_newlines();
         if !self.at(TokenType::Eof) {
@@ -1746,6 +1776,66 @@ impl Parser {
                     params.insert("delay".into(), TrialParam::Float(v));
                     params.insert("delay_unit".into(), TrialParam::Str(unit));
                 }
+                "correction" => {
+                    // correction=true | false | <int> | "unlimited" | "disabled" | "bounded"
+                    let vt = self.peek().clone();
+                    let payload = if vt.ty == TokenType::Identifier {
+                        self.advance();
+                        match vt.value.as_str() {
+                            "true" | "unlimited" => {
+                                let mut m = BTreeMap::new();
+                                m.insert("mode".into(), JsonValue::String("unlimited".into()));
+                                JsonValue::Object(m)
+                            }
+                            "false" | "disabled" => {
+                                let mut m = BTreeMap::new();
+                                m.insert("mode".into(), JsonValue::String("disabled".into()));
+                                JsonValue::Object(m)
+                            }
+                            "bounded" => {
+                                let mut m = BTreeMap::new();
+                                m.insert("mode".into(), JsonValue::String("bounded".into()));
+                                JsonValue::Object(m)
+                            }
+                            _ => {
+                                return Err(DslError::parse(
+                                    format!("MTS_CORRECTION_UNKNOWN: '{}'", vt.value),
+                                    SourceSpan::new(vt.line, vt.col),
+                                ))
+                            }
+                        }
+                    } else if vt.ty == TokenType::Number {
+                        self.advance();
+                        if vt.value.contains('.') {
+                            return Err(DslError::parse(
+                                "MTS_CORRECTION_FRACTIONAL",
+                                SourceSpan::new(vt.line, vt.col),
+                            ));
+                        }
+                        let n: i64 = vt.value.parse().unwrap_or(0);
+                        if n <= 0 {
+                            return Err(DslError::parse(
+                                format!("MTS_CORRECTION_LIMIT_NONPOSITIVE: {}", n),
+                                SourceSpan::new(vt.line, vt.col),
+                            ));
+                        }
+                        let mut m = BTreeMap::new();
+                        m.insert("mode".into(), JsonValue::String("bounded".into()));
+                        m.insert("limit".into(), JsonValue::Int(n));
+                        JsonValue::Object(m)
+                    } else if vt.ty == TokenType::StringLiteral {
+                        self.advance();
+                        let mut m = BTreeMap::new();
+                        m.insert("mode".into(), JsonValue::String(vt.value));
+                        JsonValue::Object(m)
+                    } else {
+                        return Err(DslError::parse(
+                            format!("unexpected correction value: {:?} '{}'", vt.ty, vt.value),
+                            SourceSpan::new(vt.line, vt.col),
+                        ));
+                    };
+                    params.insert("correction".into(), TrialParam::Json(payload));
+                }
                 _ if key_is_lh || canonical == "LH" => {
                     let (v, u) = self.parse_value()?;
                     if v <= 0.0 {
@@ -2535,6 +2625,18 @@ fn canonical_annotation_keyword(kw: &str) -> Option<&'static str> {
         "subject" => Some("subjects"),
         _ => None,
     }
+}
+
+fn is_declaration_mode_mts(expr: &ScheduleExpr) -> bool {
+    let target = match expr {
+        ScheduleExpr::Annotated(boxed) => &boxed.expr,
+        other => other,
+    };
+    matches!(
+        target,
+        ScheduleExpr::TrialBased(tb)
+            if tb.trial_type == "MTS" && tb.params.contains_key("samples")
+    )
 }
 
 fn annotation_value_to_json(v: &AnnotationValue) -> JsonValue {
