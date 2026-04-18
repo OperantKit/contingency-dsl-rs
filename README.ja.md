@@ -10,11 +10,11 @@
 
 言語仕様の conformance スイート
 [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
-に対する実装を進行中。`contingency-dsl-py` との全面パリティをタグ付けの目標とする。
+上の全 non-error / non-warning fixture（474 / 474）が、
+fixture の `pre_expansion` または `expected` ペイロードに対するサブセット
+マッチを満たす。
 
-Conformance 合格率は現在 **98.3%**（474 fixture 中 466 合格）。
-合格対象（fixture の `pre_expansion` または `expected` ペイロードに対する
-サブセットマッチ）：
+対応カテゴリ：
 
 - **Operant コア** — atomic、special（EXT / CRF）、second-order、compound
   （全 combinator、位置引数、スカラー kwargs COD / FRCO / BO、PUNISH の 3 形式、
@@ -35,20 +35,20 @@ Conformance 合格率は現在 **98.3%**（474 fixture 中 466 合格）。
   schedule-scope にルーティング
 - **Experiment** — `phase <Label>:` ブロック（FixedSessions、Stability、
   ExperimenterJudgment）、`shaping <Label>:` ブロック（artful / percentile、
-  stable()、sessions 基準対応）、`experiment <Label>:` paper ブロック
-  （単一スケジュール／phase-sequence body、experiment 単位の注釈
-  オーバーライド対応）、`use <Label>` フェーズ参照の解決、digit-form label
+  stable()、sessions 基準対応）、`progressive <Label>:` ブロック
+  （`steps v = [...]` テンプレート展開で N 個の `<Label>_1`..`<Label>_N`
+  フェーズを生成）、`experiment <Label>:` paper ブロック（単一スケジュール／
+  phase-sequence body、experiment 単位の注釈オーバーライド対応）、
+  `use <Label>` フェーズ参照の解決、digit-form label
 - **Composed** — autoshape、omission、two-process-theory、
   conditioned-suppression、pit
-- **Analyzer** — `let` 束縛を schedule ツリー全体に展開する binding 展開
+- **Analyzer** — `let` 束縛を schedule ツリー全体および `SecondOrder`
+  overall / unit 位置に展開する binding 展開
 
-未対応（残り 8 fixture）：
+未対応：
 
-- Experiment 層 `progressive <Label>:` のテンプレート展開
-  （`steps v = [...]` プレースホルダ置換）
-- Staged shaping（`method = staged, stages = [...]`）
-- `SecondOrder` の overall / unit 位置に `IdentifierRef` を許容する AST 拡張
 - `expected_error` fixture 用エラーコードチャネル
+- `expected_warning` fixture 用ワーニングチャネル
 
 ## 使い方
 

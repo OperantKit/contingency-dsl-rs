@@ -9,13 +9,12 @@ implementation in [`../contingency-dsl-py`](../contingency-dsl-py/).
 
 ## Status
 
-In-progress implementation tracked against the language-independent
-conformance suite at [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/).
-Full scope parity with `contingency-dsl-py` is the tagging target.
+Every non-error / non-warning fixture under the language-independent
+conformance suite at [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
+passes subset match against its `pre_expansion` or `expected` payload
+(474 / 474).
 
-Currently passing ≥99% of every non-error / non-warning fixture
-category (subset match against each fixture's `pre_expansion` or
-`expected` payload):
+Exercised fixture categories:
 
 - **Operant core** — atomic, special (EXT/CRF), second-order, compound
   (all combinators; positional args, scalar kwargs COD/FRCO/BO,
@@ -42,6 +41,8 @@ category (subset match against each fixture's `pre_expansion` or
   Stability (visual / cv / rate / iri / latency methods), and
   ExperimenterJudgment criteria; `shaping <Label>:` blocks with
   artful / percentile methods, stable() and sessions criteria;
+  `progressive <Label>:` blocks with `steps v = [...]` template
+  expansion into N labelled phases (`<Label>_1`..`<Label>_N`);
   `experiment <Label>:` paper blocks (single-schedule or phase-
   sequence body, with per-experiment annotation overrides); `use
   <Label>` phase-reference resolution; digit-form phase and experiment
@@ -50,15 +51,13 @@ category (subset match against each fixture's `pre_expansion` or
   conditioned-suppression, pit (phase-wrapped respondent / compound
   procedures)
 - **Analyzer** — binding-expansion pass that substitutes `let`-bound
-  IdentifierRef nodes with their values throughout the schedule tree
+  IdentifierRef nodes with their values throughout the schedule tree,
+  including inside `SecondOrder` overall and unit slots
 
 Not yet exercised:
 
-- Experiment layer `progressive <Label>:` block template expansion
-  (`steps v = [...]` placeholder substitution)
-- Staged shaping (`method = staged, stages = [CRF, DRH2s, DRH1s]`)
-- `SecondOrder` with an `IdentifierRef` as overall or unit
 - Error-code channel for `expected_error` fixtures
+- Warning channel for `expected_warning` fixtures
 
 ## Usage
 
