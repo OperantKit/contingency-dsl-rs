@@ -544,15 +544,32 @@ impl Parser {
             break;
         }
 
-        let schedule = self.parse_schedule()?;
+        let phase_schedule = if self.at(TokenType::NoSchedule) {
+            self.advance();
+            crate::experiment::PhaseSchedule::None
+        } else if self.at(TokenType::Use) {
+            self.advance();
+            let ref_tok = self.expect(TokenType::Identifier, "use <phase-label>")?;
+            crate::experiment::PhaseSchedule::PhaseRef(crate::experiment::PhaseRef {
+                target_label: ref_tok.value,
+            })
+        } else {
+            let s = self.parse_schedule()?;
+            crate::experiment::PhaseSchedule::Operant(s)
+        };
         self.skip_newlines();
+        // Trailing phase-level @-annotations (after the schedule line).
+        while self.at(TokenType::At) {
+            phase_annotations.push(self.parse_annotation()?);
+            self.skip_newlines();
+        }
 
         let criterion = criterion.unwrap_or(crate::experiment::Criterion::ExperimenterJudgment(
             crate::experiment::ExperimenterJudgment,
         ));
         Ok(crate::experiment::Phase {
             label: label_tok.value,
-            schedule: crate::experiment::PhaseSchedule::Operant(schedule),
+            schedule: phase_schedule,
             criterion,
             annotations: phase_annotations,
         })
@@ -2593,8 +2610,8 @@ fn validate_aversive_params(
             }
         }
         AversiveKind::Escape => {
-            if !params.contains_key("ShockDuration") {
-                return Err(DslError::parse("ESCAPE_MISSING_SHOCK_DURATION", span()));
+            if !params.contains_key("SafeDuration") && !params.contains_key("ShockDuration") {
+                return Err(DslError::parse("ESCAPE_MISSING_DURATION", span()));
             }
         }
     }
