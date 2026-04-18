@@ -266,7 +266,6 @@ impl Parser {
             .into_iter()
             .partition(|a| {
                 a.keyword == "trial_mix"
-                    || a.keyword == "probe_policy"
                     || (decl_mode_mts
                         && matches!(a.keyword.as_str(), "training" | "testing"))
             });
@@ -322,6 +321,10 @@ impl Parser {
             }
             self.skip_newlines();
         }
+        // Resolve `use <Label>` phase references to the referenced phase's
+        // schedule (backward-only lookup; forward references are left as
+        // PhaseRef until a later analyzer pass adds the richer error model).
+        resolve_phase_refs(&mut phases);
         if !self.at(TokenType::Eof) {
             let t = self.peek();
             return Err(DslError::parse(
@@ -2624,6 +2627,24 @@ fn canonical_annotation_keyword(kw: &str) -> Option<&'static str> {
         "hw" => Some("hardware"),
         "subject" => Some("subjects"),
         _ => None,
+    }
+}
+
+fn resolve_phase_refs(phases: &mut [crate::experiment::Phase]) {
+    let mut label_to_idx: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, ph) in phases.iter().enumerate() {
+        label_to_idx.entry(ph.label.clone()).or_insert(i);
+    }
+    for i in 0..phases.len() {
+        let target_label = match &phases[i].schedule {
+            crate::experiment::PhaseSchedule::PhaseRef(r) => r.target_label.clone(),
+            _ => continue,
+        };
+        if let Some(&j) = label_to_idx.get(&target_label) {
+            if j < i {
+                phases[i].schedule = phases[j].schedule.clone();
+            }
+        }
     }
 }
 
