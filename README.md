@@ -16,34 +16,62 @@ Full scope parity with `contingency-dsl-py` is the tagging target.
 Currently exercised fixture categories (subset match against each
 fixture's `pre_expansion` or `expected` payload):
 
-- Operant atomic, special (EXT/CRF), and second-order schedules
-- Operant compound schedules with positional args and scalar keyword
-  args (COD / FRCO / BO) — excluding PUNISH, directional COD, Overlay
-- DR modifiers (DRL / DRH / DRO) and `Repeat(N, schedule)`
-- `let` bindings and program-level parameter declarations
-  (`LH`, `RD`, `COD`, `FRCO`, `BO`)
-- Limited-hold postfix (`schedule LH value`)
+- **Operant core** — atomic, special (EXT/CRF), second-order, compound
+  (all combinators; positional args, scalar kwargs COD/FRCO/BO,
+  PUNISH in all three forms, directional COD, Overlay target,
+  Interpolate count/onset), DR / PR / Pctl / Lag / Repeat modifiers,
+  LimitedHold postfix, TO and ResponseCost postfix, let bindings,
+  program-level parameter declarations
+- **Aversive** — Sidman, DiscrimAv, Escape with canonical parameters
+  and aliases (partial; annotation-dependent cases pending)
+- **Stateful** — Adjusting, Interlocking, Percentile
+- **Trial-based** — MTS, GoNoGo with defaults (partial for
+  annotation-dependent declaration-mode cases)
+- **Respondent Tier A** — Pair.{ForwardDelay, ForwardTrace,
+  Simultaneous, Backward}, Extinction, CSOnly, USOnly, Contingency
+  (both signature forms), TrulyRandom, ExplicitlyUnpaired, Compound,
+  Serial, ITI, Differential
+- **Annotations** — `@keyword(...)` in program and schedule scope with
+  positional strings, keyword arguments, numeric values with
+  time-unit / percent suffix, list and object literals, negative
+  numbers, and keyword aliases (punisher → reinforcer, hw → hardware,
+  subject → subjects)
+- **Experiment** — `phase <Label>:` blocks with FixedSessions,
+  Stability (visual / cv / rate / iri / latency methods), and
+  ExperimenterJudgment criteria
 
 Not yet exercised:
 
-- PR / Pctl / Lag modifiers, aversive schedules (Sidman / DiscrimAv /
-  Escape), stateful (Adjusting / Interlocking / Percentile), trial-based
-  (MTS / GoNoGo), Timeout / ResponseCost postfix, interpolated schedules
-- Respondent layer (Pair / Extinction / CSOnly / USOnly / Contingency /
-  TrulyRandom / ExplicitlyUnpaired / Compound / Serial / ITI / Differential)
-- Composed procedures (phase-block surface syntax)
-- Experiment layer (phase / shaping / progressive / experiment blocks)
-- Annotations (`@keyword(...)` and extension registries)
+- Composed fixtures that wrap a Conc/Mult host in a phase block
+  (conditioned-suppression, pit)
+- Experiment layer `shaping <Label>:`, `progressive <Label>:`, and
+  `experiment <Label>:` paper blocks
 - Semantic analyzer (binding expansion, LH propagation, reserved-word
-  checks, warning channel)
+  checks, warning channel, `use <Label>` phase reference resolution)
 - Error-code channel for `expected_error` fixtures
+- A handful of annotation-dependent fixtures across aversive, respondent,
+  trial-based, and procedure-trial-structure layers that require
+  declaration-mode MTS with stimulus classes, structured probe-policy
+  payloads, or correction-procedure metadata
 
 ## Usage
 
 ```rust
+use contingency_dsl::{parse_top_level, program_to_json, json_to_string, TopLevel};
+
+match parse_top_level("let baseline = VI60s\nbaseline").unwrap() {
+    TopLevel::Program(p) => println!("{}", json_to_string(&program_to_json(&p))),
+    TopLevel::PhaseSequence(_) | TopLevel::Paper(_) => unreachable!(),
+}
+```
+
+For single-schedule inputs the legacy `parse(..)` → `Program` API is
+still available:
+
+```rust
 use contingency_dsl::{parse, program_to_json, json_to_string};
 
-let program = parse("let baseline = VI60s\nbaseline").unwrap();
+let program = parse("FR5").unwrap();
 println!("{}", json_to_string(&program_to_json(&program)));
 ```
 
