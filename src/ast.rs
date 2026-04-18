@@ -96,12 +96,16 @@ pub struct PunishParam {
     pub payload: JsonValue,
 }
 
-/// Compound-schedule parameter value (three shapes share one slot).
+/// Compound-schedule parameter value (four shapes share one slot).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CombinatorParamValue {
     Scalar(CompoundParam),
     Directional(DirectionalCOD),
     Punish(PunishParam),
+    /// Raw JSON value preserved verbatim by the serializer. Used for
+    /// Overlay `target=...` (string) and other compound kwargs whose shape
+    /// does not fit the scalar form.
+    Raw(JsonValue),
 }
 
 /// Compound schedule: combinator applied to 2+ sub-schedules.

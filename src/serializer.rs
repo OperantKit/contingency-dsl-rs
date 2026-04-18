@@ -326,6 +326,7 @@ fn combinator_param_to_json(v: &CombinatorParamValue) -> JsonValue {
             JsonValue::Object(m)
         }
         CombinatorParamValue::Punish(PunishParam { payload }) => payload.clone(),
+        CombinatorParamValue::Raw(v) => v.clone(),
     }
 }
 

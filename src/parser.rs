@@ -24,13 +24,15 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Atomic, Binding, CombinatorParamValue, Compound, CompoundParam, IdentifierRef, LimitedHold,
-    Modifier, ModifierKind, ParamDecl, Program, ProgramSchedule, ScheduleExpr, ScheduleType,
-    SecondOrder, Special, SpecialKind,
+    Atomic, Binding, CombinatorParamValue, Compound, CompoundParam, DirRef, DirectionalCOD,
+    DirectionalEntry, IdentifierRef, JsonValue, LimitedHold, Modifier, ModifierKind, ParamDecl,
+    Program, ProgramSchedule, PunishParam, ScheduleExpr, ScheduleType, SecondOrder, Special,
+    SpecialKind,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
 use crate::lexer::tokenize;
+use crate::serializer::expr_to_json;
 use crate::tokens::{Token, TokenType};
 
 pub fn parse(source: &str) -> Result<Program> {
@@ -388,9 +390,16 @@ impl Parser {
             ));
         }
         let mut params: BTreeMap<String, CombinatorParamValue> = BTreeMap::new();
+        let mut directional_entries: Vec<DirectionalEntry> = Vec::new();
+        let mut punish_directional: Vec<(DirRef, DirRef, ScheduleExpr)> = Vec::new();
+        let mut punish_component: Vec<(DirRef, ScheduleExpr)> = Vec::new();
+        let mut punish_changeover: Option<ScheduleExpr> = None;
+        let mut overlay_target: Option<String> = None;
         let mut has_kw = false;
+
         while self.at(TokenType::Comma) {
             self.advance();
+
             if self.at(TokenType::KwArgName) {
                 has_kw = true;
                 let kw = self.advance();
@@ -404,23 +413,166 @@ impl Parser {
                             SourceSpan::new(kw.line, kw.col),
                         )
                     })?;
+
                 if self.at(TokenType::LParen) {
+                    self.advance();
+                    if canonical == "COD" {
+                        let from_ref = self.parse_dir_ref()?;
+                        self.expect(TokenType::Arrow, "-> in directional COD")?;
+                        let to_ref = self.parse_dir_ref()?;
+                        self.expect(TokenType::RParen, "directional COD closing paren")?;
+                        self.expect(TokenType::Equals, "= after COD(x->y)")?;
+                        let (val, unit) = self.parse_value()?;
+                        directional_entries.push(DirectionalEntry {
+                            from_ref,
+                            to_ref,
+                            value: val,
+                            time_unit: unit,
+                        });
+                    } else if canonical == "PUNISH" {
+                        // Three sub-forms: PUNISH(changeover), PUNISH(N->M)
+                        // or PUNISH(ident->ident), and PUNISH(N) or PUNISH(ident).
+                        let p1 = self.peek().clone();
+                        if p1.ty == TokenType::Identifier && p1.value == "changeover" {
+                            self.advance();
+                            self.expect(TokenType::RParen, "PUNISH closing paren")?;
+                            self.expect(TokenType::Equals, "= after PUNISH(changeover)")?;
+                            let sched = self.parse_schedule()?;
+                            if punish_changeover.is_some()
+                                || !punish_directional.is_empty()
+                            {
+                                return Err(DslError::parse(
+                                    "PUNISH_TARGET_CONFLICT",
+                                    SourceSpan::new(p1.line, p1.col),
+                                ));
+                            }
+                            punish_changeover = Some(sched);
+                        } else if p1.ty == TokenType::Number
+                            || p1.ty == TokenType::Identifier
+                        {
+                            let first = self.parse_dir_ref()?;
+                            if self.at(TokenType::Arrow) {
+                                self.advance();
+                                let to_ref = self.parse_dir_ref()?;
+                                self.expect(TokenType::RParen, "PUNISH closing paren")?;
+                                self.expect(TokenType::Equals, "= after PUNISH(x->y)")?;
+                                let sched = self.parse_schedule()?;
+                                if first == to_ref {
+                                    return Err(DslError::parse(
+                                        "PUNISH_SELF_REFERENCE",
+                                        SourceSpan::new(p1.line, p1.col),
+                                    ));
+                                }
+                                if punish_changeover.is_some() {
+                                    return Err(DslError::parse(
+                                        "PUNISH_TARGET_CONFLICT",
+                                        SourceSpan::new(p1.line, p1.col),
+                                    ));
+                                }
+                                for (a, b, _) in &punish_directional {
+                                    if a == &first && b == &to_ref {
+                                        return Err(DslError::parse(
+                                            "PUNISH_DUPLICATE",
+                                            SourceSpan::new(p1.line, p1.col),
+                                        ));
+                                    }
+                                }
+                                punish_directional.push((first, to_ref, sched));
+                            } else {
+                                self.expect(TokenType::RParen, "PUNISH closing paren")?;
+                                self.expect(TokenType::Equals, "= after PUNISH(N)")?;
+                                let sched = self.parse_schedule()?;
+                                punish_component.push((first, sched));
+                            }
+                        } else {
+                            return Err(DslError::parse(
+                                format!(
+                                    "PUNISH: expected index, 'changeover', or direction, got {:?} '{}'",
+                                    p1.ty, p1.value
+                                ),
+                                SourceSpan::new(p1.line, p1.col),
+                            ));
+                        }
+                    } else {
+                        return Err(DslError::parse(
+                            format!(
+                                "INVALID_DIRECTIONAL_KW: directional form not valid for {}",
+                                canonical
+                            ),
+                            SourceSpan::new(kw.line, kw.col),
+                        ));
+                    }
+                } else {
+                    // Scalar: <kw>=value.
+                    self.expect(TokenType::Equals, "= after compound kwarg name")?;
+                    let (val, unit) = self.parse_value()?;
+                    if params.contains_key(&canonical) {
+                        return Err(DslError::parse(
+                            format!("duplicate keyword argument '{}'", canonical),
+                            SourceSpan::new(kw.line, kw.col),
+                        ));
+                    }
+                    params.insert(
+                        canonical,
+                        CombinatorParamValue::Scalar(CompoundParam {
+                            value: val,
+                            time_unit: unit,
+                        }),
+                    );
+                }
+            } else if self.at(TokenType::Identifier)
+                && self.peek().value == "target"
+                && combinator == Combinator::Overlay
+                && self
+                    .peek_at(1)
+                    .map_or(false, |n| n.ty == TokenType::Equals)
+            {
+                has_kw = true;
+                self.advance();
+                self.expect(TokenType::Equals, "= after Overlay target")?;
+                let val_tok = self.expect(TokenType::Identifier, "Overlay target value")?;
+                let v = &val_tok.value;
+                if v != "all" && v != "changeover" && !v.starts_with("component_") {
                     return Err(DslError::parse(
-                        "directional / PUNISH compound params not yet supported by rs parser",
-                        SourceSpan::new(kw.line, kw.col),
+                        format!("OVERLAY_TARGET_UNKNOWN: target='{}'", v),
+                        SourceSpan::new(val_tok.line, val_tok.col),
                     ));
                 }
-                if canonical == "PUNISH" {
+                if overlay_target.is_some() {
                     return Err(DslError::parse(
-                        "PUNISH compound param not yet supported by rs parser",
-                        SourceSpan::new(kw.line, kw.col),
+                        "OVERLAY_DUPLICATE_TARGET",
+                        SourceSpan::new(val_tok.line, val_tok.col),
                     ));
                 }
-                self.expect(TokenType::Equals, "= after compound kwarg name")?;
+                // `target=all` is the default and is not emitted into params.
+                if v != "all" {
+                    overlay_target = Some(val_tok.value.clone());
+                } else {
+                    overlay_target = Some(String::new());
+                }
+            } else if self.at(TokenType::Identifier)
+                && (self.peek().value == "count" || self.peek().value == "onset")
+                && combinator == Combinator::Interpolate
+                && self
+                    .peek_at(1)
+                    .map_or(false, |n| n.ty == TokenType::Equals)
+            {
+                has_kw = true;
+                let kw_tok = self.advance();
+                self.expect(TokenType::Equals, "= after Interpolate kwarg")?;
                 let (val, unit) = self.parse_value()?;
+                if params.contains_key(&kw_tok.value) {
+                    return Err(DslError::parse(
+                        format!("duplicate keyword argument '{}'", kw_tok.value),
+                        SourceSpan::new(kw_tok.line, kw_tok.col),
+                    ));
+                }
                 params.insert(
-                    canonical,
-                    CombinatorParamValue::Scalar(CompoundParam { value: val, time_unit: unit }),
+                    kw_tok.value,
+                    CombinatorParamValue::Scalar(CompoundParam {
+                        value: val,
+                        time_unit: unit,
+                    }),
                 );
             } else if has_kw {
                 let t = self.peek();
@@ -433,12 +585,136 @@ impl Parser {
             }
         }
         self.expect(TokenType::RParen, "compound closing paren")?;
+
+        if combinator == Combinator::Interpolate && components.len() != 2 {
+            return Err(DslError::parse(
+                format!(
+                    "INTERPOLATE_REQUIRES_TWO: got {} components",
+                    components.len()
+                ),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
+
+        // Resolve identifier-based dir_refs to 1-indexed integers.
+        let mut name_to_idx: BTreeMap<String, i64> = BTreeMap::new();
+        for (i, comp) in components.iter().enumerate() {
+            if let ScheduleExpr::IdentifierRef(r) = comp {
+                name_to_idx.insert(r.name.clone(), (i + 1) as i64);
+            }
+        }
+
+        if !directional_entries.is_empty() {
+            let mut resolved = Vec::with_capacity(directional_entries.len());
+            for entry in directional_entries.drain(..) {
+                let from_ref = resolve_dir_ref(entry.from_ref, &name_to_idx, &tok)?;
+                let to_ref = resolve_dir_ref(entry.to_ref, &name_to_idx, &tok)?;
+                resolved.push(DirectionalEntry {
+                    from_ref,
+                    to_ref,
+                    value: entry.value,
+                    time_unit: entry.time_unit,
+                });
+            }
+            let base = match params.remove("COD") {
+                Some(CombinatorParamValue::Scalar(cp)) => Some(cp),
+                Some(other) => {
+                    params.insert("COD".into(), other);
+                    None
+                }
+                None => None,
+            };
+            params.insert(
+                "COD".into(),
+                CombinatorParamValue::Directional(DirectionalCOD {
+                    base,
+                    directional: resolved,
+                }),
+            );
+        }
+
+        // Build PUNISH payload.
+        if !punish_directional.is_empty()
+            || !punish_component.is_empty()
+            || punish_changeover.is_some()
+        {
+            let mut punish = BTreeMap::new();
+            if let Some(s) = &punish_changeover {
+                punish.insert("changeover".into(), expr_to_json(s));
+            }
+            if !punish_directional.is_empty() {
+                let mut arr = Vec::with_capacity(punish_directional.len());
+                for (from_ref, to_ref, sched) in punish_directional.drain(..) {
+                    let from = resolve_dir_ref(from_ref, &name_to_idx, &tok)?;
+                    let to = resolve_dir_ref(to_ref, &name_to_idx, &tok)?;
+                    let mut m = BTreeMap::new();
+                    m.insert("from".into(), dir_ref_to_json(&from));
+                    m.insert("to".into(), dir_ref_to_json(&to));
+                    m.insert("schedule".into(), expr_to_json(&sched));
+                    arr.push(JsonValue::Object(m));
+                }
+                punish.insert("directional".into(), JsonValue::Array(arr));
+            }
+            if !punish_component.is_empty() {
+                let mut arr = Vec::with_capacity(punish_component.len());
+                for (component_ref, sched) in punish_component.drain(..) {
+                    let c = resolve_dir_ref(component_ref, &name_to_idx, &tok)?;
+                    let mut m = BTreeMap::new();
+                    m.insert("component".into(), dir_ref_to_json(&c));
+                    m.insert("schedule".into(), expr_to_json(&sched));
+                    arr.push(JsonValue::Object(m));
+                }
+                punish.insert("component".into(), JsonValue::Array(arr));
+            }
+            params.insert(
+                "PUNISH".into(),
+                CombinatorParamValue::Punish(PunishParam {
+                    payload: JsonValue::Object(punish),
+                }),
+            );
+        }
+
+        // Overlay target (non-"all" values only).
+        if let Some(t) = overlay_target {
+            if !t.is_empty() {
+                params.insert(
+                    "target".into(),
+                    CombinatorParamValue::Raw(JsonValue::String(t)),
+                );
+            }
+        }
+
         let params = if params.is_empty() { None } else { Some(params) };
         Ok(ScheduleExpr::Compound(Compound {
             combinator,
             components,
             params,
         }))
+    }
+
+    fn parse_dir_ref(&mut self) -> Result<DirRef> {
+        let t = self.peek().clone();
+        if t.ty == TokenType::Number {
+            self.advance();
+            let n: f64 = t.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid number in dir_ref: {}", t.value),
+                    SourceSpan::new(t.line, t.col),
+                )
+            })?;
+            return Ok(DirRef::Index(n as i64));
+        }
+        if t.ty == TokenType::Identifier {
+            self.advance();
+            return Ok(DirRef::Name(t.value));
+        }
+        Err(DslError::parse(
+            format!(
+                "expected number or identifier in dir_ref, got {:?} '{}'",
+                t.ty, t.value
+            ),
+            SourceSpan::new(t.line, t.col),
+        ))
     }
 
     fn parse_dr_mod(&mut self) -> Result<ScheduleExpr> {
@@ -512,5 +788,29 @@ impl Parser {
             "bare numeric literal at schedule start is not valid DSL (use Repeat(N, schedule))",
             SourceSpan::new(t.line, t.col),
         ))
+    }
+}
+
+fn resolve_dir_ref(
+    r: DirRef,
+    name_to_idx: &BTreeMap<String, i64>,
+    anchor: &Token,
+) -> Result<DirRef> {
+    match r {
+        DirRef::Index(_) => Ok(r),
+        DirRef::Name(ref n) => match name_to_idx.get(n) {
+            Some(idx) => Ok(DirRef::Index(*idx)),
+            None => Err(DslError::parse(
+                format!("directional ref '{}' does not match any component", n),
+                SourceSpan::new(anchor.line, anchor.col),
+            )),
+        },
+    }
+}
+
+fn dir_ref_to_json(r: &DirRef) -> JsonValue {
+    match r {
+        DirRef::Index(i) => JsonValue::Int(*i),
+        DirRef::Name(s) => JsonValue::String(s.clone()),
     }
 }
