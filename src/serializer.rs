@@ -465,9 +465,21 @@ fn limited_hold_to_json(lh: &LimitedHold) -> JsonValue {
 fn second_order_to_json(so: &SecondOrder) -> JsonValue {
     let mut m = BTreeMap::new();
     m.insert("type".into(), JsonValue::String("SecondOrder".into()));
-    m.insert("overall".into(), atomic_to_json(&so.overall));
-    m.insert("unit".into(), atomic_to_json(&so.unit));
+    m.insert("overall".into(), second_order_slot_to_json(&so.overall));
+    m.insert("unit".into(), second_order_slot_to_json(&so.unit));
     JsonValue::Object(m)
+}
+
+fn second_order_slot_to_json(slot: &crate::ast::SecondOrderSlot) -> JsonValue {
+    match slot {
+        crate::ast::SecondOrderSlot::Atomic(a) => atomic_to_json(a),
+        crate::ast::SecondOrderSlot::Ref(name) => {
+            let mut m = BTreeMap::new();
+            m.insert("type".into(), JsonValue::String("IdentifierRef".into()));
+            m.insert("name".into(), JsonValue::String(name.clone()));
+            JsonValue::Object(m)
+        }
+    }
 }
 
 fn identifier_ref_to_json(r: &IdentifierRef) -> JsonValue {

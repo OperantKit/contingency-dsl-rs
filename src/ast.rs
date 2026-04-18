@@ -170,10 +170,19 @@ pub struct LimitedHold {
 }
 
 /// Second-order schedule: FR5(FI30) form.
+///
+/// Either slot may be an Atomic or an IdentifierRef; the analyzer substitutes
+/// let-bound identifiers with their Atomic value during binding expansion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecondOrder {
-    pub overall: Atomic,
-    pub unit: Atomic,
+    pub overall: SecondOrderSlot,
+    pub unit: SecondOrderSlot,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SecondOrderSlot {
+    Atomic(Atomic),
+    Ref(String),
 }
 
 /// Per-schedule timeout parameters (Leitenberg, 1965).

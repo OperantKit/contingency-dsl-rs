@@ -29,7 +29,7 @@ use crate::ast::{
     DirRef, DirectionalCOD, DirectionalEntry, IdentifierRef, InterlockingSchedule, JsonValue,
     LimitedHold, Modifier, ModifierKind, NumericPayload, ParamDecl, Program, ProgramSchedule,
     PunishParam, ResponseCost, ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder,
-    Special, SpecialKind, Timeout, TimeoutWrapped, TrialBased, TrialParam,
+    SecondOrderSlot, Special, SpecialKind, Timeout, TimeoutWrapped, TrialBased, TrialParam,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -1274,26 +1274,16 @@ impl Parser {
                     }
                 }
                 let tok = self.advance();
-                let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
                 if self.at(TokenType::LParen) {
                     self.advance();
-                    let unit = self.parse_second_order_unit()?;
+                    let unit = self.parse_second_order_slot()?;
                     self.expect(TokenType::RParen, "second-order closing paren")?;
-                    // IdentifierRef as overall is not wrapped in Atomic; we
-                    // emit a SecondOrder whose overall will be resolved by the
-                    // analyzer. For now we only accept the overall as an
-                    // Atomic-compatible identifier by keeping it via the
-                    // IdentifierRef (matches py AST `SecondOrder(overall=ref)`).
-                    // To avoid a wider AST change in this pass, reject the
-                    // identifier form for now.
-                    let _ = r;
-                    let _ = unit;
-                    return Err(DslError::parse(
-                        "second-order with identifier overall not yet supported by rs parser",
-                        SourceSpan::new(tok.line, tok.col),
-                    ));
+                    return Ok(ScheduleExpr::SecondOrder(SecondOrder {
+                        overall: SecondOrderSlot::Ref(tok.value),
+                        unit,
+                    }));
                 }
-                Ok(r)
+                Ok(ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value }))
             }
             _ => {
                 let t = self.peek();
@@ -1309,22 +1299,26 @@ impl Parser {
         let atomic = self.parse_parametric_atomic()?;
         if self.at(TokenType::LParen) {
             self.advance();
-            let unit = self.parse_second_order_unit()?;
+            let unit = self.parse_second_order_slot()?;
             self.expect(TokenType::RParen, "second-order closing paren")?;
-            // py restricts unit to Atomic; we enforce the same.
-            let unit_atomic = match unit {
-                ScheduleExpr::Atomic(a) => a,
-                _ => {
-                    let t = self.peek();
-                    return Err(DslError::parse(
-                        "second-order unit must be Atomic",
-                        SourceSpan::new(t.line, t.col),
-                    ));
-                }
-            };
-            return Ok(ScheduleExpr::SecondOrder(SecondOrder { overall: atomic, unit: unit_atomic }));
+            return Ok(ScheduleExpr::SecondOrder(SecondOrder {
+                overall: SecondOrderSlot::Atomic(atomic),
+                unit,
+            }));
         }
         Ok(ScheduleExpr::Atomic(atomic))
+    }
+
+    fn parse_second_order_slot(&mut self) -> Result<SecondOrderSlot> {
+        let t = self.peek().clone();
+        if t.ty == TokenType::Identifier
+            && !self.peek_at(1).map_or(false, |n| n.ty == TokenType::LParen)
+        {
+            self.advance();
+            return Ok(SecondOrderSlot::Ref(t.value));
+        }
+        let atomic = self.parse_parametric_atomic()?;
+        Ok(SecondOrderSlot::Atomic(atomic))
     }
 
     fn parse_parametric_atomic(&mut self) -> Result<Atomic> {
@@ -1358,23 +1352,6 @@ impl Parser {
             value: val,
             time_unit: unit,
         })
-    }
-
-    fn parse_second_order_unit(&mut self) -> Result<ScheduleExpr> {
-        let t = self.peek();
-        if t.ty == TokenType::Identifier {
-            if let Some(next) = self.peek_at(1) {
-                if next.ty != TokenType::LParen {
-                    let tok = self.advance();
-                    return Ok(ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value }));
-                }
-            } else {
-                let tok = self.advance();
-                return Ok(ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value }));
-            }
-        }
-        let atomic = self.parse_parametric_atomic()?;
-        Ok(ScheduleExpr::Atomic(atomic))
     }
 
     pub(crate) fn parse_value(&mut self) -> Result<(f64, Option<String>)> {
@@ -2790,11 +2767,10 @@ fn expand_schedule(
             lh.inner = Box::new(expand_schedule(*lh.inner, env));
             ScheduleExpr::LimitedHold(lh)
         }
-        ScheduleExpr::SecondOrder(mut so) => {
-            // SecondOrder overall/unit are Atomic — skip IdentifierRef
-            // resolution here (parser ensured Atomic type already).
-            let _ = &mut so;
-            ScheduleExpr::SecondOrder(so)
+        ScheduleExpr::SecondOrder(so) => {
+            let overall = resolve_slot(so.overall, env);
+            let unit = resolve_slot(so.unit, env);
+            ScheduleExpr::SecondOrder(SecondOrder { overall, unit })
         }
         ScheduleExpr::TimeoutWrapped(mut tw) => {
             tw.inner = Box::new(expand_schedule(*tw.inner, env));
@@ -2812,6 +2788,19 @@ fn expand_schedule(
             }))
         }
         other => other,
+    }
+}
+
+fn resolve_slot(
+    slot: SecondOrderSlot,
+    env: &BTreeMap<String, ScheduleExpr>,
+) -> SecondOrderSlot {
+    match slot {
+        SecondOrderSlot::Ref(name) => match env.get(&name) {
+            Some(ScheduleExpr::Atomic(a)) => SecondOrderSlot::Atomic(a.clone()),
+            _ => SecondOrderSlot::Ref(name),
+        },
+        SecondOrderSlot::Atomic(a) => SecondOrderSlot::Atomic(a),
     }
 }
 
