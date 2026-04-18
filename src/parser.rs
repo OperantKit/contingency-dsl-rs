@@ -377,7 +377,15 @@ impl Parser {
                 } else if self.at(TokenType::Gte) {
                     self.advance();
                     let nt = self.expect(TokenType::Number, "min sessions")?;
-                    min_sessions = Some(nt.value.parse().unwrap_or(0));
+                    let n: i64 = nt.value.parse().unwrap_or(0);
+                    min_sessions = Some(n);
+                    // If a stable() criterion was already declared, attach
+                    // min_sessions to it retroactively.
+                    if let Some(crate::experiment::Criterion::Stability(s)) =
+                        user_criterion.as_mut()
+                    {
+                        s.min_sessions = Some(n);
+                    }
                 }
                 continue;
             }
