@@ -196,10 +196,15 @@ impl Parser {
         };
         self.expect(TokenType::Colon, ": after experiment label")?;
         self.skip_newlines();
+        // Experiment-body annotations (appear at the top of the body,
+        // before phase blocks or the schedule expression). These become
+        // the Experiment-level `shared_annotations` in the emitted AST.
+        let mut body_annotations: Vec<Annotation> = Vec::new();
+        while self.at(TokenType::At) {
+            body_annotations.push(self.parse_annotation()?);
+            self.skip_newlines();
+        }
 
-        // Body: a single schedule or a phase-block sequence. Reuse the
-        // existing machinery by detecting a leading Phase/Shaping token.
-        let _body_annotations: Vec<Annotation> = Vec::new();
         let mut phases: Vec<crate::experiment::Phase> = Vec::new();
         if self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
             while self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
@@ -226,7 +231,7 @@ impl Parser {
         Ok(crate::experiment::Experiment {
             label,
             phases,
-            annotations: Vec::new(),
+            annotations: body_annotations,
         })
     }
 
