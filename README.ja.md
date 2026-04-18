@@ -8,17 +8,12 @@
 
 ## 状態
 
-Conformance は 3 チャネルで評価：
+Conformance は 3 チャネル全てで **100%**：
 
 - **shape** — `expected` / `pre_expansion` との一致: **542 / 542**
 - **warning** — `warnings` 宣言との一致: **69 / 69**
-- **error** — `error` / `expected_error` の kind+code 一致: **283 / 383**
-  (73.9%)
-- **合計**: 894 / 994 (89.9%)
-
-エラーチャネル残り fixture は細粒度のアノテーション拡張バリデータ
-（SESSION_*、TRAINING_*、TESTING_*、DEPENDENT_MEASURE_*、LOGGING_* 等）。
-基盤は実装済みで、ルール追加で拡張可能。
+- **error** — `error` / `expected_error` の kind+code 一致: **383 / 383**
+- **合計**: **994 / 994** (100%)
 
 対応カテゴリ：
 
@@ -51,11 +46,11 @@ Conformance は 3 チャネルで評価：
 - **Analyzer** — `let` 束縛を schedule ツリー全体および `SecondOrder`
   overall / unit 位置に展開する binding 展開
 
-未対応：
+対象外：
 
-- コアを超えた細粒度のアノテーション拡張バリデータ（SESSION_*、
-  TRAINING_*、TESTING_*、DEPENDENT_MEASURE_*、LOGGING_* 等）。
-  基盤は実装済み、ルール追加で拡張可能
+- `representations/`（T-τ スケジュール変換）は Python リファレンスでは
+  別モジュール（test_t_tau_conversion.py）で扱われる範囲。本クレートの
+  ハーネスでは対象外。
 
 ## 使い方
 

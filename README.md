@@ -11,21 +11,15 @@ implementation in [`../contingency-dsl-py`](../contingency-dsl-py/).
 
 Conformance against the language-independent suite at
 [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
-covers three channels:
+covers three channels — **all 100% passing**:
 
 - **shape** — fixtures with `expected` / `pre_expansion` produce the
   matching JSON shape: **542 / 542**
 - **warning** — fixtures with `warnings` emit each listed code via
   `collect_warnings()`: **69 / 69**
 - **error** — fixtures with `error` / `expected_error` produce a
-  `DslError` whose kind and code match: **283 / 383** (73.9%)
-- **total**: 894 / 994 (89.9%)
-
-Remaining error-channel fixtures are fine-grained annotation-extension
-validators (SESSION_*, TRAINING_*, TESTING_*, DEPENDENT_MEASURE_*,
-LOGGING_*, etc.) whose exact thresholds and enum vocabularies vary
-from the fixture prose; the analyzer framework is in place and can
-accept more rules as they are specified.
+  `DslError` whose kind and code match: **383 / 383**
+- **total**: **994 / 994** (100%)
 
 Exercised fixture categories:
 
@@ -67,12 +61,9 @@ Exercised fixture categories:
   IdentifierRef nodes with their values throughout the schedule tree,
   including inside `SecondOrder` overall and unit slots
 
-Not yet exercised:
-
-- Fine-grained annotation validators beyond the core semantic checks
-  (SESSION_*, TRAINING_*, TESTING_*, DEPENDENT_MEASURE_* and related
-  extension-registry-shaped codes). The analyzer framework is in
-  place and extensible.
+The `representations/` fixtures (T-τ schedule conversions) are a
+separate test module in the Python reference; they are not exercised
+by this crate's harness.
 
 ## Usage
 

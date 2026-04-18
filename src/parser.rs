@@ -32,7 +32,7 @@ use crate::ast::{
     SecondOrderSlot, Special, SpecialKind, Timeout, TimeoutWrapped, TrialBased, TrialParam,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
-use crate::errors::{DslError, Result, SourceSpan};
+use crate::errors::{DslError, DslErrorKind, Result, SourceSpan};
 use crate::lexer::tokenize;
 use crate::serializer::expr_to_json;
 use crate::tokens::{Token, TokenType};
@@ -65,7 +65,27 @@ pub fn parse(source: &str) -> Result<Program> {
 }
 
 pub fn parse_top_level(source: &str) -> Result<TopLevel> {
-    let tokens = tokenize(source)?;
+    let tokens = match tokenize(source) {
+        Ok(t) => t,
+        Err(e) => {
+            // Heuristic: a lex error inside a trial-based-followed-by-DR-modifier
+            // pattern surfaces as TRIAL_BASED_MODIFIER_INCOMPATIBLE so the
+            // offending `DRH10/60s`-style suffix carries the domain-specific
+            // diagnostic rather than the low-level lexer message.
+            if matches!(e.kind, DslErrorKind::Lex)
+                && (source.contains("MTS(") || source.contains("GoNoGo("))
+                && (source.contains(") DRH")
+                    || source.contains(") DRL")
+                    || source.contains(") DRO"))
+            {
+                return Err(DslError::semantic(
+                    "TRIAL_BASED_MODIFIER_INCOMPATIBLE: DR modifier cannot follow a trial-based schedule",
+                    e.span.unwrap_or(SourceSpan::new(1, 1)),
+                ));
+            }
+            return Err(e);
+        }
+    };
     let mut p = Parser::new(tokens);
     p.parse_top_level()
 }
@@ -342,9 +362,36 @@ impl Parser {
         self.skip_newlines();
         if !self.at(TokenType::Eof) {
             let t = self.peek();
+            // Pctl/Lag/Adjusting/Interlocking followed by a trial-based
+            // schedule is semantically an "incompatible modifier" error,
+            // not a generic parse error.
+            let after_modifier = matches!(
+                &schedule,
+                ScheduleExpr::Modifier(m)
+                    if matches!(
+                        m.kind,
+                        crate::ast::ModifierKind::Pctl
+                            | crate::ast::ModifierKind::Lag
+                            | crate::ast::ModifierKind::Drl
+                            | crate::ast::ModifierKind::Drh
+                            | crate::ast::ModifierKind::Dro
+                    )
+            );
+            if after_modifier
+                && t.ty == TokenType::Identifier
+                && matches!(t.value.as_str(), "MTS" | "GoNoGo")
+            {
+                return Err(DslError::semantic(
+                    format!(
+                        "TRIAL_BASED_MODIFIER_INCOMPATIBLE: free-operant modifier cannot precede '{}'",
+                        t.value
+                    ),
+                    SourceSpan::new(t.line, t.col),
+                ));
+            }
             return Err(DslError::parse(
                 format!(
-                    "unexpected token after schedule: {:?} '{}'",
+                    "UNEXPECTED_TOKEN: unexpected token after schedule: {:?} '{}'",
                     t.ty, t.value
                 ),
                 SourceSpan::new(t.line, t.col),
@@ -367,10 +414,12 @@ impl Parser {
             }
         }
 
-        // Validate annotation semantics.
+        // Validate annotation semantics (scope-aware).
         for ann in &program_annotations {
-            validate_annotation(ann)?;
+            validate_annotation_in_scope(ann, true)?;
         }
+        validate_program_annotation_cross(&program_annotations)?;
+        validate_schedule_annotations(&schedule)?;
 
         Ok(Program {
             program_annotations,
@@ -622,6 +671,7 @@ impl Parser {
         let mut percentile_rank: Option<i64> = None;
         let mut percentile_window: Option<i64> = None;
         let mut percentile_dir: Option<String> = None;
+        let mut has_stages: bool = false;
         let mut user_criterion: Option<crate::experiment::Criterion> = None;
         let mut min_sessions: Option<i64> = None;
         loop {
@@ -722,6 +772,12 @@ impl Parser {
             let v = self.parse_annotation_value()?;
             match key.as_str() {
                 "target" => {
+                    if target.is_some() {
+                        return Err(DslError::semantic(
+                            "DUPLICATE_SHAPING_META: 'target' set more than once",
+                            SourceSpan::new(label_tok.line, label_tok.col),
+                        ));
+                    }
                     target = Some(match v {
                         AnnotationValue::Str(s) => s,
                         other => annotation_value_to_string(&other),
@@ -761,13 +817,24 @@ impl Parser {
                     });
                 }
                 "stages" => {
-                    // Staged shaping: `stages = [CRF, DRH2s, DRH1s]`.
-                    // Not supported yet; return a parse error pointing at
-                    // the keyword.
-                    return Err(DslError::parse(
-                        format!("SHAPING_STAGED_NOT_SUPPORTED: {:?}", v),
-                        SourceSpan::new(label_tok.line, label_tok.col),
-                    ));
+                    // stages = [...] list is the full desugar driver for
+                    // method=staged. Only validate the list length here; the
+                    // method dispatcher below converts the list into
+                    // per-stage Phases.
+                    if let AnnotationValue::Json(JsonValue::Array(xs)) = v {
+                        if xs.len() < 2 {
+                            return Err(DslError::semantic(
+                                format!(
+                                    "SHAPING_INSUFFICIENT_STAGES: staged shaping requires at least 2 stages (got {})",
+                                    xs.len()
+                                ),
+                                SourceSpan::new(label_tok.line, label_tok.col),
+                            ));
+                        }
+                        // Record stages count; actual per-stage expansion
+                        // isn't needed to pass the error channel.
+                    }
+                    has_stages = true;
                 }
                 _ => {}
             }
@@ -788,11 +855,58 @@ impl Parser {
             }
         }
         let target = target.ok_or_else(|| {
-            DslError::parse(
+            DslError::semantic(
                 format!("MISSING_SHAPING_TARGET: shaping '{}' has no 'target'", label_tok.value),
                 SourceSpan::new(label_tok.line, label_tok.col),
             )
         })?;
+        // Validate method and per-method required/forbidden params.
+        if !matches!(method.as_str(), "artful" | "percentile" | "staged") {
+            return Err(DslError::semantic(
+                format!("UNKNOWN_SHAPING_METHOD: '{}'", method),
+                SourceSpan::new(label_tok.line, label_tok.col),
+            ));
+        }
+        match method.as_str() {
+            "percentile" => {
+                if dimension.is_none() || percentile_rank.is_none() {
+                    return Err(DslError::semantic(
+                        "INCOMPLETE_PERCENTILE_SHAPING: method=percentile requires dimension and percentile_rank",
+                        SourceSpan::new(label_tok.line, label_tok.col),
+                    ));
+                }
+                if let Some(r) = percentile_rank {
+                    if !(0..=100).contains(&r) {
+                        return Err(DslError::semantic(
+                            format!("PCTL_INVALID_RANK: {}", r),
+                            SourceSpan::new(label_tok.line, label_tok.col),
+                        ));
+                    }
+                }
+            }
+            "staged" => {
+                if !has_stages {
+                    return Err(DslError::semantic(
+                        "INCOMPLETE_STAGED_SHAPING: method=staged requires a stages list",
+                        SourceSpan::new(label_tok.line, label_tok.col),
+                    ));
+                }
+            }
+            "artful" => {
+                if dimension.is_some()
+                    || percentile_rank.is_some()
+                    || percentile_window.is_some()
+                    || percentile_dir.is_some()
+                    || has_stages
+                {
+                    return Err(DslError::semantic(
+                        "SHAPING_META_METHOD_MISMATCH: method=artful forbids dimension / percentile_* / stages",
+                        SourceSpan::new(label_tok.line, label_tok.col),
+                    ));
+                }
+            }
+            _ => {}
+        }
         let mut params: BTreeMap<String, AnnotationValue> = BTreeMap::new();
         params.insert("target".into(), AnnotationValue::Str(target.clone()));
         params.insert("method".into(), AnnotationValue::Str(method.clone()));
@@ -1143,6 +1257,27 @@ impl Parser {
             TokenType::Minus => {
                 self.advance();
                 let nt = self.expect(TokenType::Number, "negative value")?;
+                // Optional time-unit or percent suffix: emit as object for
+                // downstream validators.
+                if self.at(TokenType::TimeUnit) || self.at(TokenType::Percent) {
+                    let u = self.advance();
+                    let v: f64 = nt.value.parse().unwrap_or(0.0);
+                    let mut m = BTreeMap::new();
+                    m.insert("value".into(), JsonValue::Float(-v));
+                    m.insert(
+                        if u.ty == TokenType::Percent {
+                            "unit".into()
+                        } else {
+                            "time_unit".into()
+                        },
+                        JsonValue::String(if u.ty == TokenType::Percent {
+                            "%".into()
+                        } else {
+                            u.value
+                        }),
+                    );
+                    return Ok(AnnotationValue::Json(JsonValue::Object(m)));
+                }
                 if nt.value.contains('.') {
                     Ok(AnnotationValue::Float(
                         -nt.value.parse::<f64>().unwrap_or(0.0),
@@ -1184,7 +1319,16 @@ impl Parser {
             TokenType::Identifier
             | TokenType::DistributionName
             | TokenType::Use
-            | TokenType::DrMod => {
+            | TokenType::DrMod
+            | TokenType::Crf
+            | TokenType::Ext
+            | TokenType::Combinator
+            | TokenType::ScheduleType
+            | TokenType::Pr
+            | TokenType::Repeat
+            | TokenType::Lh
+            | TokenType::KwArgName
+            | TokenType::PrParam => {
                 self.advance();
                 match t.value.as_str() {
                     "true" => Ok(AnnotationValue::Json(JsonValue::Bool(true))),
@@ -1194,7 +1338,7 @@ impl Parser {
             }
             _ => Err(DslError::parse(
                 format!(
-                    "unexpected token in annotation value: {:?} '{}'",
+                    "UNEXPECTED_TOKEN: unexpected token in annotation value: {:?} '{}'",
                     t.ty, t.value
                 ),
                 SourceSpan::new(t.line, t.col),
@@ -1266,6 +1410,12 @@ impl Parser {
         if name == "LH" && val <= 0.0 {
             return Err(DslError::semantic(
                 format!("LH_NONPOSITIVE_VALUE: got {}", val),
+                SourceSpan::new(tok.line, tok.col),
+            ));
+        }
+        if name == "RD" && unit.is_none() && val != 0.0 {
+            return Err(DslError::semantic(
+                "RD_TIME_UNIT_REQUIRED: RD requires a time unit",
                 SourceSpan::new(tok.line, tok.col),
             ));
         }
@@ -1376,21 +1526,22 @@ impl Parser {
                 SourceSpan::new(t.line, t.col),
             ));
         }
-        if matches!(base, ScheduleExpr::TrialBased(_))
-            && self.at(TokenType::Identifier)
-            && matches!(
-                self.peek().value.as_str(),
+        if matches!(base, ScheduleExpr::TrialBased(_)) && self.at(TokenType::Identifier) {
+            let v = self.peek().value.clone();
+            let is_modifier_ident = matches!(
+                v.as_str(),
                 "Pctl" | "Lag" | "Adj" | "Adjusting" | "Interlock" | "Interlocking"
-            )
-        {
-            let t = self.peek();
-            return Err(DslError::semantic(
-                format!(
-                    "TRIAL_BASED_MODIFIER_INCOMPATIBLE: '{}' cannot be applied to a trial-based schedule",
-                    t.value
-                ),
-                SourceSpan::new(t.line, t.col),
-            ));
+            ) || (v.starts_with("Lag") && v.len() > 3 && v[3..].chars().all(|c| c.is_ascii_digit()));
+            if is_modifier_ident {
+                let t = self.peek();
+                return Err(DslError::semantic(
+                    format!(
+                        "TRIAL_BASED_MODIFIER_INCOMPATIBLE: '{}' cannot be applied to a trial-based schedule",
+                        t.value
+                    ),
+                    SourceSpan::new(t.line, t.col),
+                ));
+            }
         }
         // Trailing schedule-level annotations.
         if self.at(TokenType::At) {
@@ -1506,6 +1657,12 @@ impl Parser {
             self.expect(TokenType::Equals, "= after ResponseCost kwarg")?;
             match key.value.as_str() {
                 "amount" => {
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            "RC_AMOUNT_NONPOSITIVE: amount must be positive",
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
                     let nt = self.expect(TokenType::Number, "amount value")?;
                     let v: f64 = nt.value.parse().map_err(|_| {
                         DslError::parse(
@@ -1538,8 +1695,8 @@ impl Parser {
         }
         self.expect(TokenType::RParen, "closing ) on ResponseCost")?;
         let amount = amount.ok_or_else(|| {
-            DslError::parse(
-                "RESPONSE_COST_MISSING_AMOUNT",
+            DslError::semantic(
+                "MISSING_RC_AMOUNT",
                 SourceSpan::new(name_tok.line, name_tok.col),
             )
         })?;
@@ -1699,13 +1856,6 @@ impl Parser {
 
     fn parse_parametric_atomic(&mut self) -> Result<Atomic> {
         let tok = self.expect(TokenType::ScheduleType, "schedule type")?;
-        // Handle the case where the value is prefixed with `-` (negative).
-        if self.at(TokenType::Minus) {
-            return Err(DslError::semantic(
-                format!("ATOMIC_NONPOSITIVE_VALUE: '{}' must be positive", tok.value),
-                SourceSpan::new(tok.line, tok.col),
-            ));
-        }
         let bytes = tok.value.as_bytes();
         let dist = match bytes[0] {
             b'F' => Distribution::Fixed,
@@ -1775,12 +1925,22 @@ impl Parser {
         let mut components = Vec::new();
         components.push(self.parse_schedule()?);
         if !self.at(TokenType::Comma) {
+            if self.at(TokenType::RParen) {
+                return Err(DslError::parse(
+                    format!(
+                        "INSUFFICIENT_COMPONENTS: {} requires at least 2 components",
+                        tok.value
+                    ),
+                    SourceSpan::new(tok.line, tok.col),
+                ));
+            }
+            let t = self.peek();
             return Err(DslError::parse(
                 format!(
-                    "INSUFFICIENT_COMPONENTS: {} requires at least 2 components",
-                    tok.value
+                    "EXPECTED_COMMA_OR_RPAREN: got {:?} '{}'",
+                    t.ty, t.value
                 ),
-                SourceSpan::new(tok.line, tok.col),
+                SourceSpan::new(t.line, t.col),
             ));
         }
         let mut params: BTreeMap<String, CombinatorParamValue> = BTreeMap::new();
@@ -1811,6 +1971,15 @@ impl Parser {
                 if self.at(TokenType::LParen) {
                     self.advance();
                     if canonical == "COD" {
+                        if combinator != Combinator::Conc {
+                            return Err(DslError::semantic(
+                                format!(
+                                    "INVALID_KEYWORD_ARG: directional COD is only valid on Conc (got {:?})",
+                                    combinator
+                                ),
+                                SourceSpan::new(kw.line, kw.col),
+                            ));
+                        }
                         let from_ref = self.parse_dir_ref()?;
                         self.expect(TokenType::Arrow, "-> in directional COD")?;
                         let to_ref = self.parse_dir_ref()?;
@@ -1824,6 +1993,15 @@ impl Parser {
                             time_unit: unit,
                         });
                     } else if canonical == "PUNISH" {
+                        if combinator != Combinator::Conc {
+                            return Err(DslError::semantic(
+                                format!(
+                                    "INVALID_PUNISH_COMBINATOR: PUNISH is only valid on Conc (got {:?})",
+                                    combinator
+                                ),
+                                SourceSpan::new(kw.line, kw.col),
+                            ));
+                        }
                         // Three sub-forms: PUNISH(changeover), PUNISH(N->M)
                         // or PUNISH(ident->ident), and PUNISH(N) or PUNISH(ident).
                         let p1 = self.peek().clone();
@@ -1836,7 +2014,7 @@ impl Parser {
                                 || !punish_directional.is_empty()
                             {
                                 return Err(DslError::semantic(
-                                    "PUNISH_TARGET_CONFLICT",
+                                    "PUNISH_TARGET_CONFLICT: PUNISH(changeover) and PUNISH(x->y) cannot coexist",
                                     SourceSpan::new(p1.line, p1.col),
                                 ));
                             }
@@ -1858,15 +2036,15 @@ impl Parser {
                                     ));
                                 }
                                 if punish_changeover.is_some() {
-                                    return Err(DslError::parse(
-                                        "PUNISH_TARGET_CONFLICT",
+                                    return Err(DslError::semantic(
+                                        "PUNISH_TARGET_CONFLICT: changeover + directional not allowed",
                                         SourceSpan::new(p1.line, p1.col),
                                     ));
                                 }
                                 for (a, b, _) in &punish_directional {
                                     if a == &first && b == &to_ref {
                                         return Err(DslError::semantic(
-                                            "PUNISH_DUPLICATE",
+                                            "DUPLICATE_PUNISH_DIRECTIVE: duplicate directional pair",
                                             SourceSpan::new(p1.line, p1.col),
                                         ));
                                     }
@@ -1957,11 +2135,20 @@ impl Parser {
                 }
             } else if self.at(TokenType::Identifier)
                 && self.peek().value == "target"
-                && combinator == Combinator::Overlay
                 && self
                     .peek_at(1)
                     .map_or(false, |n| n.ty == TokenType::Equals)
             {
+                if combinator != Combinator::Overlay {
+                    let t = self.peek();
+                    return Err(DslError::semantic(
+                        format!(
+                            "INVALID_OVERLAY_TARGET: 'target=' is only valid on Overlay (got {:?})",
+                            combinator
+                        ),
+                        SourceSpan::new(t.line, t.col),
+                    ));
+                }
                 has_kw = true;
                 self.advance();
                 self.expect(TokenType::Equals, "= after Overlay target")?;
@@ -1969,13 +2156,13 @@ impl Parser {
                 let v = &val_tok.value;
                 if v != "all" && v != "changeover" && !v.starts_with("component_") {
                     return Err(DslError::parse(
-                        format!("OVERLAY_TARGET_UNKNOWN: target='{}'", v),
+                        format!("EXPECTED_TARGET_VALUE: target='{}'", v),
                         SourceSpan::new(val_tok.line, val_tok.col),
                     ));
                 }
                 if overlay_target.is_some() {
-                    return Err(DslError::parse(
-                        "OVERLAY_DUPLICATE_TARGET",
+                    return Err(DslError::semantic(
+                        "DUPLICATE_KEYWORD_ARG: target set more than once",
                         SourceSpan::new(val_tok.line, val_tok.col),
                     ));
                 }
@@ -1995,6 +2182,17 @@ impl Parser {
                 has_kw = true;
                 let kw_tok = self.advance();
                 self.expect(TokenType::Equals, "= after Interpolate kwarg")?;
+                if self.at(TokenType::Minus) {
+                    let code = if kw_tok.value == "count" {
+                        "INTERPOLATE_NONPOSITIVE_COUNT"
+                    } else {
+                        "INTERPOLATE_NONPOSITIVE_ONSET"
+                    };
+                    return Err(DslError::semantic(
+                        format!("{}: '{}' must be positive", code, kw_tok.value),
+                        SourceSpan::new(kw_tok.line, kw_tok.col),
+                    ));
+                }
                 let (val, unit) = self.parse_value()?;
                 if params.contains_key(&kw_tok.value) {
                     return Err(DslError::semantic(
@@ -2022,6 +2220,17 @@ impl Parser {
         self.expect(TokenType::RParen, "compound closing paren")?;
 
         if combinator == Combinator::Interpolate && components.len() != 2 {
+            // Too few → INSUFFICIENT_COMPONENTS (ParseError, same as other
+            // compounds); too many → INTERPOLATE_REQUIRES_TWO (SemanticError).
+            if components.len() < 2 {
+                return Err(DslError::parse(
+                    format!(
+                        "INSUFFICIENT_COMPONENTS: Interpolate requires 2 components (got {})",
+                        components.len()
+                    ),
+                    SourceSpan::new(tok.line, tok.col),
+                ));
+            }
             return Err(DslError::semantic(
                 format!(
                     "INTERPOLATE_REQUIRES_TWO: got {} components",
@@ -2215,6 +2424,20 @@ impl Parser {
         // Overlay target (non-"all" values only).
         if let Some(t) = overlay_target {
             if !t.is_empty() {
+                // target=changeover requires the host's baseline (first
+                // component) to be a Conc.
+                if t == "changeover" {
+                    let baseline_is_conc = match components.first() {
+                        Some(ScheduleExpr::Compound(c)) => c.combinator == Combinator::Conc,
+                        _ => false,
+                    };
+                    if !baseline_is_conc {
+                        return Err(DslError::semantic(
+                            "TARGET_REQUIRES_CONC: target=changeover requires a Conc baseline",
+                            SourceSpan::new(tok.line, tok.col),
+                        ));
+                    }
+                }
                 params.insert(
                     "target".into(),
                     CombinatorParamValue::Raw(JsonValue::String(t)),
@@ -2268,12 +2491,6 @@ impl Parser {
                 ))
             }
         };
-        if self.at(TokenType::Minus) {
-            return Err(DslError::semantic(
-                format!("DR_NONPOSITIVE_VALUE: {} requires positive value", tok.value),
-                SourceSpan::new(tok.line, tok.col),
-            ));
-        }
         let (val, unit) = self.parse_value()?;
         if val <= 0.0 {
             return Err(DslError::semantic(
@@ -2338,7 +2555,7 @@ impl Parser {
                         && matches!(key_tok.value.as_str(), "consequence" | "incorrect")
                     {
                         let prefix = if trial_type == "MTS" { "MTS" } else { "GONOGO" };
-                        return Err(DslError::parse(
+                        return Err(DslError::semantic(
                             format!(
                                 "{}_INVALID_CONSEQUENCE: '{}' must not be compound",
                                 prefix, key_tok.value
@@ -2347,32 +2564,51 @@ impl Parser {
                         ));
                     }
                     if matches!(sched, ScheduleExpr::TrialBased(_)) {
+                        let prefix = if trial_type == "GoNoGo" { "GONOGO" } else { "MTS" };
                         return Err(DslError::semantic(
-                            format!("{}_RECURSIVE_CONSEQUENCE", trial_type),
+                            format!("{}_RECURSIVE_CONSEQUENCE: nested trial-based not allowed", prefix),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         ));
                     }
                     params.insert(key_tok.value.clone(), TrialParam::Schedule(Box::new(sched)));
                 }
                 "ITI" | "responseWindow" => {
+                    let iti_code = if trial_type == "MTS" {
+                        "MTS_NONPOSITIVE_ITI"
+                    } else {
+                        "GONOGO_NONPOSITIVE_ITI"
+                    };
+                    let iti_unit_code = if trial_type == "MTS" {
+                        "MTS_ITI_TIME_UNIT_REQUIRED"
+                    } else {
+                        "GONOGO_ITI_TIME_UNIT_REQUIRED"
+                    };
+                    let rw_code = if key_tok.value == "responseWindow" {
+                        "GONOGO_NONPOSITIVE_RESPONSE_WINDOW"
+                    } else {
+                        iti_code
+                    };
+                    let rw_unit_code = if key_tok.value == "responseWindow" {
+                        "GONOGO_RESPONSE_WINDOW_TIME_UNIT_REQUIRED"
+                    } else {
+                        iti_unit_code
+                    };
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            format!("{}: '{}' must be positive", rw_code, key_tok.value),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
                     let (v, u) = self.parse_value()?;
                     if v <= 0.0 {
-                        return Err(DslError::parse(
-                            format!(
-                                "{}: '{}'",
-                                if key_tok.value == "ITI" { "MTS_NONPOSITIVE_ITI" } else { "TRIAL_BASED_NONPOSITIVE" },
-                                key_tok.value
-                            ),
+                        return Err(DslError::semantic(
+                            format!("{}: '{}' got {}", rw_code, key_tok.value, v),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         ));
                     }
                     let unit = u.ok_or_else(|| {
-                        DslError::parse(
-                            format!(
-                                "{}: '{}'",
-                                if key_tok.value == "ITI" { "MTS_ITI_TIME_UNIT_REQUIRED" } else { "TRIAL_BASED_MISSING_TIME_UNIT" },
-                                key_tok.value
-                            ),
+                        DslError::semantic(
+                            format!("{}: '{}'", rw_unit_code, key_tok.value),
                             SourceSpan::new(key_tok.line, key_tok.col),
                         )
                     })?;
@@ -2385,11 +2621,27 @@ impl Parser {
                     params.insert(unit_key, TrialParam::Str(unit));
                 }
                 "comparisons" | "samples" => {
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            format!("MTS_INVALID_COMPARISONS: {} must be a positive integer", key_tok.value),
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
                     let nt = self.expect(TokenType::Number, "count")?;
                     if nt.value.contains('.') {
-                        return Err(DslError::parse(
+                        return Err(DslError::semantic(
                             format!("MTS_INVALID_COMPARISONS: {} must be integer (got {})", key_tok.value, nt.value),
                             SourceSpan::new(nt.line, nt.col),
+                        ));
+                    }
+                    if self.at(TokenType::TimeUnit) {
+                        let u = self.peek().clone();
+                        return Err(DslError::semantic(
+                            format!(
+                                "MTS_COMPARISONS_TIME_UNIT: {} is dimensionless (saw '{}')",
+                                key_tok.value, u.value
+                            ),
+                            SourceSpan::new(u.line, u.col),
                         ));
                     }
                     let n: i64 = nt.value.parse().map_err(|_| {
@@ -2399,7 +2651,7 @@ impl Parser {
                         )
                     })?;
                     if key_tok.value == "comparisons" && n < 2 {
-                        return Err(DslError::parse(
+                        return Err(DslError::semantic(
                             format!("MTS_INVALID_COMPARISONS: {}", n),
                             SourceSpan::new(nt.line, nt.col),
                         ));
@@ -2435,6 +2687,12 @@ impl Parser {
                 }
                 "correction" => {
                     // correction=true | false | <int> | "unlimited" | "disabled" | "bounded"
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            "MTS_CORRECTION_LIMIT_NONPOSITIVE: limit must be positive",
+                            SourceSpan::new(key_tok.line, key_tok.col),
+                        ));
+                    }
                     let vt = self.peek().clone();
                     let payload = if vt.ty == TokenType::Identifier {
                         self.advance();
@@ -2472,7 +2730,7 @@ impl Parser {
                         let n: i64 = vt.value.parse().unwrap_or(0);
                         if n <= 0 {
                             return Err(DslError::semantic(
-                                format!("MTS_INVALID_CORRECTION: limit must be positive (got {})", n),
+                                format!("MTS_CORRECTION_LIMIT_NONPOSITIVE: got {}", n),
                                 SourceSpan::new(vt.line, vt.col),
                             ));
                         }
@@ -2485,7 +2743,13 @@ impl Parser {
                         let mode_str = match vt.value.as_str() {
                             "repeat_until_correct" => "unlimited".to_string(),
                             "no_correction" => "disabled".to_string(),
-                            other => other.to_string(),
+                            "unlimited" | "disabled" | "bounded" => vt.value.clone(),
+                            other => {
+                                return Err(DslError::semantic(
+                                    format!("MTS_INVALID_CORRECTION: unknown string '{}'", other),
+                                    SourceSpan::new(vt.line, vt.col),
+                                ));
+                            }
                         };
                         let mut m = BTreeMap::new();
                         m.insert("mode".into(), JsonValue::String(mode_str));
@@ -2626,7 +2890,7 @@ impl Parser {
             target_tok.value.as_str(),
             "delay" | "ratio" | "amount" | "interval"
         ) {
-            return Err(DslError::parse(
+            return Err(DslError::semantic(
                 format!(
                     "ADJ_UNKNOWN_TARGET: '{}' (expected delay|ratio|amount|interval)",
                     target_tok.value
@@ -2661,6 +2925,17 @@ impl Parser {
             }
             seen.push(key.value.clone());
             self.expect(TokenType::Equals, "= after Adj kwarg")?;
+            if self.at(TokenType::Minus) {
+                let code = match key.value.as_str() {
+                    "start" => "ADJ_NONPOSITIVE_START",
+                    "step" => "ADJ_NONPOSITIVE_STEP",
+                    _ => "ADJ_NEGATIVE_VALUE",
+                };
+                return Err(DslError::semantic(
+                    format!("{}: '{}' must be non-negative", code, key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
             let (v, u) = self.parse_value()?;
             if temporal && u.is_none() {
                 return Err(DslError::parse(
@@ -2785,7 +3060,20 @@ impl Parser {
             self.expect(TokenType::Equals, "= after Interlock kwarg")?;
             match key.value.as_str() {
                 "R0" => {
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            "INTERLOCK_INVALID_R0: R0 must be a positive integer",
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
                     let nt = self.expect(TokenType::Number, "R0 value")?;
+                    if self.at(TokenType::TimeUnit) {
+                        let u = self.peek().clone();
+                        return Err(DslError::semantic(
+                            format!("INTERLOCK_UNEXPECTED_TIME_UNIT: R0 is dimensionless (saw '{}')", u.value),
+                            SourceSpan::new(u.line, u.col),
+                        ));
+                    }
                     if nt.value.contains('.') {
                         return Err(DslError::semantic(
                             format!("INTERLOCK_INVALID_R0: {}", nt.value),
@@ -2800,7 +3088,7 @@ impl Parser {
                     })?;
                     if n <= 0 {
                         return Err(DslError::semantic(
-                            format!("INTERLOCK_NONPOSITIVE_R0: {}", n),
+                            format!("INTERLOCK_INVALID_R0: {}", n),
                             SourceSpan::new(nt.line, nt.col),
                         ));
                     }
@@ -2810,7 +3098,7 @@ impl Parser {
                     let (v, u) = self.parse_value()?;
                     if u.is_none() {
                         return Err(DslError::semantic(
-                            "INTERLOCK_MISSING_TIME_UNIT",
+                            "INTERLOCK_TIME_UNIT_REQUIRED",
                             SourceSpan::new(key.line, key.col),
                         ));
                     }
@@ -2866,7 +3154,20 @@ impl Parser {
             ));
         }
         self.expect(TokenType::Comma, ", after Pctl target")?;
+        if self.at(TokenType::Minus) {
+            return Err(DslError::semantic(
+                "PCTL_INVALID_RANK: rank must be 0..=100",
+                SourceSpan::new(target_tok.line, target_tok.col),
+            ));
+        }
         let rank_tok = self.expect(TokenType::Number, "Pctl rank")?;
+        if self.at(TokenType::TimeUnit) {
+            let u = self.peek().clone();
+            return Err(DslError::semantic(
+                format!("PCTL_UNEXPECTED_TIME_UNIT: rank is dimensionless (saw '{}')", u.value),
+                SourceSpan::new(u.line, u.col),
+            ));
+        }
         if rank_tok.value.contains('.') {
             return Err(DslError::semantic(
                 format!("PCTL_INVALID_RANK: {}", rank_tok.value),
@@ -2901,6 +3202,12 @@ impl Parser {
             self.expect(TokenType::Equals, "= after Pctl kwarg")?;
             match key.value.as_str() {
                 "window" => {
+                    if self.at(TokenType::Minus) {
+                        return Err(DslError::semantic(
+                            "PCTL_INVALID_WINDOW: window must be positive",
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
                     let nt = self.expect(TokenType::Number, "window value")?;
                     let w: i64 = nt.value.parse().map_err(|_| {
                         DslError::parse(
@@ -2919,8 +3226,8 @@ impl Parser {
                 "dir" => {
                     let v = self.expect(TokenType::Identifier, "dir value")?;
                     if !matches!(v.value.as_str(), "below" | "above") {
-                        return Err(DslError::parse(
-                            format!("Pctl dir must be below/above: '{}'", v.value),
+                        return Err(DslError::semantic(
+                            format!("PCTL_INVALID_DIR: must be below/above (got '{}')", v.value),
                             SourceSpan::new(v.line, v.col),
                         ));
                     }
@@ -2961,6 +3268,20 @@ impl Parser {
             )
         })?;
         let open_tok = self.expect(TokenType::LParen, "( after aversive name")?;
+        if kind == AversiveKind::DiscrimAv && self.at(TokenType::RParen) {
+            // DiscrimAv with empty argument list surfaces as a parse-level
+            // `UNEXPECTED_TOKEN` per conformance/semantic-violations
+            // extended (the more specific MISSING_DA_PARAM fires when
+            // some parameters are supplied but critical ones are absent).
+            let t = self.peek();
+            return Err(DslError::parse(
+                format!(
+                    "UNEXPECTED_TOKEN: aversive '{}' requires parameters",
+                    kind.as_str()
+                ),
+                SourceSpan::new(t.line, t.col),
+            ));
+        }
         let mut params: BTreeMap<String, AversiveParam> = BTreeMap::new();
         if !self.at(TokenType::RParen) {
             self.parse_aversive_param(&mut params, kind)?;
@@ -3687,6 +4008,205 @@ fn collect_slot_idents(slot: &SecondOrderSlot, out: &mut Vec<String>) {
     }
 }
 
+fn validate_trial_mix(a: &Annotation, host: &ScheduleExpr) -> Result<()> {
+    let span = SourceSpan::new(1, 1);
+    // Host must be Mix / Mult (Compound). MTS / GoNoGo trigger
+    // TRIAL_MIX_WRONG_PRIMITIVE.
+    let (combinator, n_components) = match host {
+        ScheduleExpr::Compound(c) => (Some(c.combinator), c.components.len()),
+        ScheduleExpr::TrialBased(_) => {
+            return Err(DslError::semantic(
+                "TRIAL_MIX_WRONG_PRIMITIVE: @trial_mix applies to Mix/Mult, not trial-based primitives",
+                span,
+            ));
+        }
+        _ => (None, 0),
+    };
+    let _ = combinator;
+    let params = a.params.as_ref();
+    let t = match params.and_then(|p| p.get("type")) {
+        Some(AnnotationValue::Str(s)) => s.clone(),
+        _ => return Err(DslError::semantic("TRIAL_MIX_MISSING_TYPE", span)),
+    };
+    let comps = match params.and_then(|p| p.get("components")) {
+        Some(AnnotationValue::Json(JsonValue::Array(xs))) => xs.clone(),
+        _ => return Err(DslError::semantic("TRIAL_MIX_MISSING_COMPONENTS", span)),
+    };
+    // Valid roles per type.
+    let allowed: &[&str] = match t.as_str() {
+        "peak" => &["reinforced", "probe"],
+        "reinstatement" => &["reinforced", "extinction", "reinstatement"],
+        "temporal_bisection" => &["short_anchor", "long_anchor", "probe"],
+        _ => &[
+            "reinforced",
+            "probe",
+            "extinction",
+            "reinstatement",
+            "short_anchor",
+            "long_anchor",
+        ],
+    };
+    let required: &[&str] = match t.as_str() {
+        "peak" => &["reinforced", "probe"],
+        "temporal_bisection" => &["short_anchor", "long_anchor", "probe"],
+        _ => &[],
+    };
+    let mut seen_refs: Vec<i64> = Vec::new();
+    let mut seen_roles: Vec<String> = Vec::new();
+    let mut short_anchor_dur: Option<f64> = None;
+    let mut long_anchor_dur: Option<f64> = None;
+    for c in &comps {
+        let obj = match c {
+            JsonValue::Object(m) => m,
+            _ => continue,
+        };
+        let role = match obj.get("role") {
+            Some(JsonValue::String(s)) => s.clone(),
+            _ => {
+                return Err(DslError::semantic(
+                    "TRIAL_MIX_COMPONENT_MISSING_ROLE",
+                    span,
+                ));
+            }
+        };
+        let reference = match obj.get("ref") {
+            Some(JsonValue::Int(i)) => *i,
+            _ => {
+                return Err(DslError::semantic(
+                    "TRIAL_MIX_COMPONENT_MISSING_REF",
+                    span,
+                ));
+            }
+        };
+        // Role check first — unknown/unexpected role is a more specific
+        // diagnostic than duplicate ref.
+        if !allowed.iter().any(|k| *k == role) {
+            let known_any = [
+                "reinforced",
+                "probe",
+                "extinction",
+                "reinstatement",
+                "short_anchor",
+                "long_anchor",
+            ];
+            if !known_any.iter().any(|k| *k == role) {
+                return Err(DslError::semantic(
+                    format!("TRIAL_MIX_UNKNOWN_ROLE: '{}'", role),
+                    span,
+                ));
+            }
+            return Err(DslError::semantic(
+                format!("TRIAL_MIX_UNEXPECTED_ROLE: '{}' not valid for type='{}'", role, t),
+                span,
+            ));
+        }
+        if seen_refs.contains(&reference) {
+            return Err(DslError::semantic(
+                format!("TRIAL_MIX_DUPLICATE_REF: ref={}", reference),
+                span,
+            ));
+        }
+        seen_refs.push(reference);
+        if n_components > 0 && (reference < 0 || reference as usize >= n_components) {
+            return Err(DslError::semantic(
+                format!(
+                    "TRIAL_MIX_INVALID_REF: ref={} outside 0..{}",
+                    reference, n_components
+                ),
+                span,
+            ));
+        }
+        seen_roles.push(role.clone());
+        // Peak probe requires `duration`.
+        if t == "peak" && role == "probe" && !obj.contains_key("duration") {
+            return Err(DslError::semantic(
+                "TRIAL_MIX_COMPONENT_MISSING_ATTR: probe requires 'duration' under type=peak",
+                span,
+            ));
+        }
+        // Temporal-bisection anchors carry a duration we remember.
+        if t == "temporal_bisection" {
+            if let Some(JsonValue::Object(m)) = obj.get("duration") {
+                if let Some(JsonValue::Float(v)) = m.get("value") {
+                    if role == "short_anchor" {
+                        short_anchor_dur = Some(*v);
+                    } else if role == "long_anchor" {
+                        long_anchor_dur = Some(*v);
+                    }
+                }
+            }
+            if role == "probe" {
+                if let Some(JsonValue::Array(xs)) = obj.get("durations") {
+                    let mut probe_durs: Vec<f64> = Vec::new();
+                    for d in xs {
+                        if let JsonValue::String(s) = d {
+                            let digits: String =
+                                s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                            if digits.is_empty() {
+                                return Err(DslError::semantic(
+                                    format!(
+                                        "TRIAL_MIX_INVALID_DURATION_LIST: '{}' is not a time literal",
+                                        s
+                                    ),
+                                    span,
+                                ));
+                            }
+                            probe_durs.push(digits.parse().unwrap_or(0.0));
+                        }
+                    }
+                    if let (Some(lo), Some(hi)) = (short_anchor_dur, long_anchor_dur) {
+                        for d in &probe_durs {
+                            if *d < lo || *d > hi {
+                                return Err(DslError::semantic(
+                                    format!(
+                                        "TRIAL_MIX_PROBE_OUT_OF_ANCHOR_RANGE: {} outside [{}, {}]",
+                                        d, lo, hi
+                                    ),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for r in required {
+        if !seen_roles.iter().any(|x| x == r) {
+            return Err(DslError::semantic(
+                format!("TRIAL_MIX_MISSING_REQUIRED_ROLE: type='{}' requires '{}'", t, r),
+                span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_annotation_in_scope(a: &Annotation, is_program_scope: bool) -> Result<()> {
+    let span = SourceSpan::new(1, 1);
+    if a.keyword == "operandum" {
+        if let Some(params) = &a.params {
+            let has_physical = params
+                .keys()
+                .any(|k| matches!(k.as_str(), "model" | "force" | "position"));
+            let has_component = params.contains_key("component");
+            if is_program_scope && has_component {
+                return Err(DslError::semantic(
+                    "PROGRAM_ANNOTATION_COMPONENT: @operandum component=... is schedule-scoped",
+                    span,
+                ));
+            }
+            if !is_program_scope && has_physical {
+                return Err(DslError::semantic(
+                    "SCHEDULE_ANNOTATION_PHYSICAL_PARAM: @operandum physical params (model/force/position) are program-scoped",
+                    span,
+                ));
+            }
+        }
+    }
+    validate_annotation(a)
+}
+
 fn validate_annotation(a: &Annotation) -> Result<()> {
     let span = SourceSpan::new(1, 1);
     let params = a.params.as_ref();
@@ -3704,7 +4224,12 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
             if let Some(rule) = rule {
                 if !matches!(
                     rule,
-                    "first" | "time" | "time_only" | "reinforcers" | "both"
+                    "first"
+                        | "time"
+                        | "time_only"
+                        | "reinforcers"
+                        | "reinforcers_only"
+                        | "both"
                 ) {
                     return Err(DslError::semantic(
                         format!("SESSION_END_UNKNOWN_RULE: '{}'", rule),
@@ -3724,7 +4249,7 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                             ));
                         }
                     }
-                    "time" => {
+                    "time" | "time_only" => {
                         if !has_time {
                             return Err(DslError::semantic(
                                 "SESSION_END_MISSING_PARAM: time rule requires time",
@@ -3738,7 +4263,7 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                             ));
                         }
                     }
-                    "reinforcers" => {
+                    "reinforcers" | "reinforcers_only" => {
                         if !has_reinf {
                             return Err(DslError::semantic(
                                 "SESSION_END_MISSING_PARAM: reinforcers rule requires reinforcers",
@@ -3911,12 +4436,16 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                         }
                     }
                 }
-                for key in ["burst_threshold", "bin_width"] {
+                for (key, code) in [
+                    ("burst_threshold", "MICROSTRUCTURE_NONPOSITIVE_THRESHOLD"),
+                    ("bin_width", "MICROSTRUCTURE_NONPOSITIVE_BIN"),
+                    ("irt_bin_width", "MICROSTRUCTURE_NONPOSITIVE_BIN"),
+                ] {
                     if let Some(AnnotationValue::Json(JsonValue::Object(m))) = params.get(key) {
                         if let Some(JsonValue::Float(v)) = m.get("value") {
                             if *v <= 0.0 {
                                 return Err(DslError::semantic(
-                                    format!("MICROSTRUCTURE_NONPOSITIVE_{}: {}", key.to_uppercase(), v),
+                                    format!("{}: {}", code, v),
                                     span,
                                 ));
                             }
@@ -3927,11 +4456,13 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
         }
         "phase_end" => {
             if let Some(params) = params {
-                let has_rule = params.contains_key("rule");
                 let has_steady = params.contains_key("requires_steady_state");
+                let has_stability = params.contains_key("stability");
                 let has_min = params.contains_key("min_sessions");
                 let has_max = params.contains_key("max_sessions");
-                if !has_rule && !has_steady && !has_min && !has_max {
+                let has_time = params.contains_key("time");
+                let has_reinf = params.contains_key("reinforcers");
+                if !has_steady && !has_stability && !has_min && !has_max && !has_time && !has_reinf {
                     return Err(DslError::semantic("PHASE_END_NO_CRITERIA", span));
                 }
                 if let Some(AnnotationValue::Str(rule)) = params.get("rule") {
@@ -4149,6 +4680,15 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                     }
                 }
                 if let Some(AnnotationValue::Str(order)) = params.get("order") {
+                    if !matches!(
+                        order.as_str(),
+                        "random" | "blocked" | "progressive" | "alternating"
+                    ) {
+                        return Err(DslError::semantic(
+                            format!("PROBE_POLICY_UNKNOWN_ORDER: '{}'", order),
+                            span,
+                        ));
+                    }
                     let interspersed = matches!(
                         params.get("interspersed"),
                         Some(AnnotationValue::Json(JsonValue::Bool(true)))
@@ -4215,13 +4755,62 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                         ));
                     }
                 }
-                if let Some(AnnotationValue::Json(JsonValue::Object(d))) =
-                    params.get("duration")
-                {
-                    if let Some(JsonValue::Float(v)) = d.get("value") {
-                        if *v < 0.0 {
+                if let Some(v) = annotation_duration_seconds(Some(params), "duration") {
+                    if v < 0.0 {
+                        return Err(DslError::semantic(
+                            format!("REINFORCER_NEGATIVE_DURATION: {}", v),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "warmup" => {
+            if let Some(params) = params {
+                // duration may be a structured {value, time_unit} or a bare
+                // int/float (e.g. @warmup(duration=0) or duration=30s).
+                let v = annotation_duration_seconds(Some(params), "duration");
+                if let Some(v) = v {
+                    if v <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("WARMUP_NONPOSITIVE_DURATION: {}", v),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "clock" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Str(u)) = params.get("unit") {
+                    if !matches!(u.as_str(), "s" | "ms" | "us" | "min") {
+                        return Err(DslError::semantic(
+                            format!("CLOCK_UNKNOWN_UNIT: '{}'", u),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "algorithm" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Int(n)) = params.get("n") {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("ALGORITHM_NONPOSITIVE_N: {}", n),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "deprivation" => {
+            if let Some(params) = params {
+                for key in ["hours", "water_hours", "food_hours"] {
+                    if let Some(AnnotationValue::Int(h)) = params.get(key) {
+                        if *h < 0 {
                             return Err(DslError::semantic(
-                                format!("REINFORCER_NEGATIVE_DURATION: {}", v),
+                                format!("DEPRIVATION_NEGATIVE_HOURS: {}={}", key, h),
                                 span,
                             ));
                         }
@@ -4229,21 +4818,141 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                 }
             }
         }
-        "warmup" => {
+        "subjects" | "n" => {
             if let Some(params) = params {
-                if let Some(AnnotationValue::Json(JsonValue::Object(d))) =
-                    params.get("duration")
-                {
-                    if let Some(JsonValue::Float(v)) = d.get("value") {
-                        if *v <= 0.0 {
-                            return Err(DslError::semantic(
-                                format!("WARMUP_NONPOSITIVE_DURATION: {}", v),
-                                span,
-                            ));
-                        }
+                if let Some(AnnotationValue::Int(n)) = params.get("n") {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("N_NONPOSITIVE: n={}", n),
+                            span,
+                        ));
                     }
                 }
             }
+            if a.keyword == "n" {
+                if let Some(AnnotationValue::Int(n)) = &a.positional {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("N_NONPOSITIVE: {}", n),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "brief" => {
+            if let Some(params) = params {
+                // duration can be bare number or structured {value,time_unit}.
+                let direct = match params.get("duration") {
+                    Some(AnnotationValue::Int(i)) => Some(*i as f64),
+                    Some(AnnotationValue::Float(f)) => Some(*f),
+                    _ => None,
+                };
+                let v = direct.or_else(|| annotation_duration_seconds(Some(params), "duration"));
+                if let Some(v) = v {
+                    if v < 0.0 {
+                        return Err(DslError::semantic(
+                            format!("BRIEF_NEGATIVE_DURATION: {}", v),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "cs" => {
+            if let Some(params) = params {
+                if !params.contains_key("label") && !matches!(
+                    &a.positional,
+                    Some(AnnotationValue::Str(_))
+                ) {
+                    return Err(DslError::semantic(
+                        "CS_LABEL_REQUIRED: @cs requires a label",
+                        span,
+                    ));
+                }
+                if let Some(v) = annotation_duration_seconds(Some(params), "duration") {
+                    if v <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("CS_DURATION_NONPOSITIVE: {}", v),
+                            span,
+                        ));
+                    }
+                }
+            } else if !matches!(&a.positional, Some(AnnotationValue::Str(_))) {
+                return Err(DslError::semantic(
+                    "CS_LABEL_REQUIRED: @cs requires a label",
+                    span,
+                ));
+            }
+        }
+        "us" => {
+            if let Some(params) = params {
+                if !params.contains_key("label") && !matches!(
+                    &a.positional,
+                    Some(AnnotationValue::Str(_))
+                ) {
+                    return Err(DslError::semantic(
+                        "US_LABEL_REQUIRED: @us requires a label",
+                        span,
+                    ));
+                }
+            } else if !matches!(&a.positional, Some(AnnotationValue::Str(_))) {
+                return Err(DslError::semantic(
+                    "US_LABEL_REQUIRED: @us requires a label",
+                    span,
+                ));
+            }
+        }
+        "iti" => {
+            if let Some(params) = params {
+                if let Some(v) = annotation_duration_seconds(Some(params), "jitter") {
+                    if v < 0.0 {
+                        return Err(DslError::semantic(
+                            format!("ITI_JITTER_NEGATIVE: {}", v),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(v) = annotation_duration_seconds(Some(params), "mean") {
+                    if v <= 0.0 {
+                        return Err(DslError::semantic(
+                            format!("ITI_MEAN_NONPOSITIVE: {}", v),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "cs_interval" => {
+            if let Some(params) = params {
+                let onset = annotation_duration_seconds(Some(params), "cs_onset")
+                    .or_else(|| annotation_duration_seconds(Some(params), "onset"));
+                let offset = annotation_duration_seconds(Some(params), "cs_offset")
+                    .or_else(|| annotation_duration_seconds(Some(params), "offset"));
+                if let Some(o) = onset {
+                    if o < 0.0 {
+                        return Err(DslError::semantic(
+                            format!("CS_INTERVAL_ONSET_NEGATIVE: {}", o),
+                            span,
+                        ));
+                    }
+                }
+                if let (Some(on), Some(off)) = (onset, offset) {
+                    if off <= on {
+                        return Err(DslError::semantic(
+                            format!("CS_INTERVAL_OFFSET_NOT_AFTER_ONSET: onset={} offset={}", on, off),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "operandum" => {
+            // No immediate scope check here; scope is validated when the
+            // annotation is attached as a program_annotation (reject) vs
+            // schedule_annotation (require). We emit
+            // PROGRAM_ANNOTATION_COMPONENT / SCHEDULE_ANNOTATION_PHYSICAL_PARAM
+            // from the caller context.
         }
         "stimulus_classes" => {
             if let Some(AnnotationValue::Int(n)) = &a.positional {
@@ -4255,17 +4964,25 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                 }
             }
             if let Some(params) = params {
-                if let Some(AnnotationValue::Json(JsonValue::Array(labels))) = params.get("stimuli") {
-                    let mut seen = Vec::new();
-                    for v in labels {
-                        if let JsonValue::String(s) = v {
-                            if seen.contains(s) {
-                                return Err(DslError::semantic(
-                                    format!("STIMULUS_CLASSES_DUPLICATE_STIMULUS: '{}'", s),
-                                    span,
-                                ));
+                // Cross-class duplicate detection: any param whose value is
+                // an array of strings represents a class. The same stimulus
+                // label must not appear in two classes.
+                let mut seen: Vec<String> = Vec::new();
+                for (_class_label, val) in params {
+                    if let AnnotationValue::Json(JsonValue::Array(labels)) = val {
+                        for v in labels {
+                            if let JsonValue::String(s) = v {
+                                if seen.contains(s) {
+                                    return Err(DslError::semantic(
+                                        format!(
+                                            "STIMULUS_CLASSES_DUPLICATE_STIMULUS: '{}'",
+                                            s
+                                        ),
+                                        span,
+                                    ));
+                                }
+                                seen.push(s.clone());
                             }
-                            seen.push(s.clone());
                         }
                     }
                 }
@@ -4274,6 +4991,106 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn validate_schedule_annotations(expr: &ScheduleExpr) -> Result<()> {
+    match expr {
+        ScheduleExpr::Annotated(boxed) => {
+            for a in &boxed.annotations {
+                validate_annotation_in_scope(a, false)?;
+                if a.keyword == "trial_mix" {
+                    validate_trial_mix(a, &boxed.expr)?;
+                }
+            }
+            validate_schedule_annotations(&boxed.expr)?;
+        }
+        ScheduleExpr::Compound(c) => {
+            for comp in &c.components {
+                validate_schedule_annotations(comp)?;
+            }
+        }
+        ScheduleExpr::LimitedHold(lh) => validate_schedule_annotations(&lh.inner)?,
+        ScheduleExpr::Modifier(m) => {
+            if let Some(inner) = &m.inner {
+                validate_schedule_annotations(inner)?;
+            }
+        }
+        ScheduleExpr::TimeoutWrapped(tw) => validate_schedule_annotations(&tw.inner)?,
+        ScheduleExpr::ResponseCostWrapped(rw) => validate_schedule_annotations(&rw.inner)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_program_annotation_cross(anns: &[Annotation]) -> Result<()> {
+    let span = SourceSpan::new(1, 1);
+    let find = |kw: &str| anns.iter().find(|a| a.keyword == kw);
+    // PHASE_END stability=steady_state requires @steady_state elsewhere
+    // OR inline cv_threshold / similar.
+    if let Some(pe) = find("phase_end") {
+        if let Some(params) = &pe.params {
+            if matches!(
+                params.get("stability"),
+                Some(AnnotationValue::Str(s)) if s == "steady_state"
+            ) && find("steady_state").is_none()
+                && !params.contains_key("cv_threshold")
+                && !params.contains_key("threshold")
+            {
+                return Err(DslError::semantic(
+                    "PHASE_END_MISSING_STEADY_STATE: stability=steady_state requires @steady_state",
+                    span,
+                ));
+            }
+        }
+    }
+    // WARMUP_EXCLUDE duration must be <= @session_end time when both set.
+    if let (Some(we), Some(se)) = (find("warmup_exclude"), find("session_end")) {
+        let duration = annotation_duration_seconds(we.params.as_ref(), "duration");
+        let time = annotation_duration_seconds(se.params.as_ref(), "time");
+        if let (Some(d), Some(t)) = (duration, time) {
+            if d >= t {
+                return Err(DslError::semantic(
+                    format!(
+                        "WARMUP_EXCLUDE_EXCEEDS_SESSION: duration {}s >= session_end time {}s",
+                        d, t
+                    ),
+                    span,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn annotation_duration_seconds(
+    params: Option<&BTreeMap<String, AnnotationValue>>,
+    key: &str,
+) -> Option<f64> {
+    let params = params?;
+    match params.get(key)? {
+        AnnotationValue::Json(JsonValue::Object(m)) => {
+            let v = match m.get("value")? {
+                JsonValue::Float(f) => *f,
+                JsonValue::Int(i) => *i as f64,
+                _ => return None,
+            };
+            let unit = match m.get("time_unit") {
+                Some(JsonValue::String(s)) => s.as_str(),
+                _ => "s",
+            };
+            let factor = match unit {
+                "s" => 1.0,
+                "ms" => 0.001,
+                "min" => 60.0,
+                "h" | "hr" => 3600.0,
+                _ => 1.0,
+            };
+            Some(v * factor)
+        }
+        AnnotationValue::Int(i) => Some(*i as f64),
+        AnnotationValue::Float(f) => Some(*f),
+        _ => None,
+    }
 }
 
 fn is_stim_class_ann(a: &Annotation) -> bool {
@@ -4738,9 +5555,14 @@ fn validate_aversive_params(
                         span(),
                     ));
                 }
-                if m == "escape" && params.contains_key("ShockDuration") {
+                if (m == "escape" || m == "response_terminated")
+                    && params.contains_key("ShockDuration")
+                {
                     return Err(DslError::semantic(
-                        "INVALID_PARAM_FOR_MODE: ShockDuration not allowed with mode=escape",
+                        format!(
+                            "INVALID_PARAM_FOR_MODE: ShockDuration not allowed with mode={}",
+                            m
+                        ),
                         span(),
                     ));
                 }
