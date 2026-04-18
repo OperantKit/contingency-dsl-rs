@@ -8,11 +8,17 @@
 
 ## 状態
 
-言語仕様の conformance スイート
-[`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
-上の全 non-error / non-warning fixture（474 / 474）が、
-fixture の `pre_expansion` または `expected` ペイロードに対するサブセット
-マッチを満たす。
+Conformance は 3 チャネルで評価：
+
+- **shape** — `expected` / `pre_expansion` との一致: **542 / 542**
+- **warning** — `warnings` 宣言との一致: **69 / 69**
+- **error** — `error` / `expected_error` の kind+code 一致: **283 / 383**
+  (73.9%)
+- **合計**: 894 / 994 (89.9%)
+
+エラーチャネル残り fixture は細粒度のアノテーション拡張バリデータ
+（SESSION_*、TRAINING_*、TESTING_*、DEPENDENT_MEASURE_*、LOGGING_* 等）。
+基盤は実装済みで、ルール追加で拡張可能。
 
 対応カテゴリ：
 
@@ -47,8 +53,9 @@ fixture の `pre_expansion` または `expected` ペイロードに対するサ�
 
 未対応：
 
-- `expected_error` fixture 用エラーコードチャネル
-- `expected_warning` fixture 用ワーニングチャネル
+- コアを超えた細粒度のアノテーション拡張バリデータ（SESSION_*、
+  TRAINING_*、TESTING_*、DEPENDENT_MEASURE_*、LOGGING_* 等）。
+  基盤は実装済み、ルール追加で拡張可能
 
 ## 使い方
 
