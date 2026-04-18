@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use crate::ast::{
     Atomic, Binding, CombinatorParamValue, Compound, CompoundParam, DirRef, DirectionalCOD,
     DirectionalEntry, IdentifierRef, JsonValue, LimitedHold, Modifier, ModifierKind, ParamDecl,
-    Program, ProgramSchedule, PunishParam, ScheduleExpr, ScheduleType, SecondOrder, Special,
-    SpecialKind,
+    Program, ProgramSchedule, PunishParam, ResponseCost, ResponseCostWrapped, ScheduleExpr,
+    ScheduleType, SecondOrder, Special, SpecialKind, Timeout, TimeoutWrapped,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -196,30 +196,207 @@ impl Parser {
     }
 
     fn parse_schedule(&mut self) -> Result<ScheduleExpr> {
-        let base = self.parse_base_schedule()?;
-        // Postfix LH?
+        let mut base = self.parse_base_schedule()?;
+        // Postfix LH.
         if self.at(TokenType::Lh) {
-            if let Some(next) = self.peek_at(1) {
-                if next.ty == TokenType::Equals {
-                    return Ok(base);
+            let skip = self
+                .peek_at(1)
+                .map_or(false, |n| n.ty == TokenType::Equals);
+            if !skip {
+                self.advance();
+                if matches!(base, ScheduleExpr::Compound(_)) {
+                    let t = self.peek();
+                    return Err(DslError::parse(
+                        "LH_ON_COMPOUND: LH applies to leaf schedules only",
+                        SourceSpan::new(t.line, t.col),
+                    ));
                 }
+                let (hv, hu) = self.parse_value()?;
+                base = ScheduleExpr::LimitedHold(LimitedHold {
+                    hold_duration: hv,
+                    inner: Box::new(base),
+                    time_unit: hu,
+                });
             }
-            self.advance();
+        }
+        // Postfix TO(...) / Timeout(...).
+        if self.at(TokenType::Identifier) {
+            let v = &self.peek().value;
+            if (v == "TO" || v == "Timeout")
+                && self
+                    .peek_at(1)
+                    .map_or(false, |n| n.ty == TokenType::LParen)
+            {
+                if matches!(base, ScheduleExpr::Compound(_)) {
+                    let t = self.peek();
+                    return Err(DslError::parse(
+                        "TIMEOUT_ON_COMPOUND: TO(...) applies to leaf schedules only",
+                        SourceSpan::new(t.line, t.col),
+                    ));
+                }
+                base = self.parse_timeout_postfix(base)?;
+            }
+        }
+        // Postfix ResponseCost(...).
+        if self.at(TokenType::Identifier)
+            && self.peek().value == "ResponseCost"
+            && self
+                .peek_at(1)
+                .map_or(false, |n| n.ty == TokenType::LParen)
+        {
             if matches!(base, ScheduleExpr::Compound(_)) {
                 let t = self.peek();
                 return Err(DslError::parse(
-                    "LH_ON_COMPOUND: LH applies to leaf schedules only",
+                    "RC_ON_COMPOUND: ResponseCost applies to leaf schedules only",
                     SourceSpan::new(t.line, t.col),
                 ));
             }
-            let (hv, hu) = self.parse_value()?;
-            return Ok(ScheduleExpr::LimitedHold(LimitedHold {
-                hold_duration: hv,
-                inner: Box::new(base),
-                time_unit: hu,
-            }));
+            base = self.parse_response_cost_postfix(base)?;
         }
         Ok(base)
+    }
+
+    fn parse_timeout_postfix(&mut self, inner: ScheduleExpr) -> Result<ScheduleExpr> {
+        let name_tok = self.advance();
+        self.expect(TokenType::LParen, "TO opening paren")?;
+        let mut duration: Option<f64> = None;
+        let mut duration_unit: Option<String> = None;
+        let mut reset: Option<bool> = None;
+        let mut seen: Vec<String> = Vec::new();
+        while !self.at(TokenType::RParen) {
+            let key = self.expect(TokenType::Identifier, "TO kwarg name")?;
+            if seen.iter().any(|s| s == &key.value) {
+                return Err(DslError::parse(
+                    format!("TIMEOUT_DUPLICATE_KWARG: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            seen.push(key.value.clone());
+            self.expect(TokenType::Equals, "= after TO kwarg")?;
+            match key.value.as_str() {
+                "duration" => {
+                    let (v, u) = self.parse_value()?;
+                    if v <= 0.0 {
+                        return Err(DslError::parse(
+                            format!("TIMEOUT_NONPOSITIVE_DURATION: {}", v),
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
+                    if u.is_none() {
+                        return Err(DslError::parse(
+                            "TIMEOUT_MISSING_TIME_UNIT",
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
+                    duration = Some(v);
+                    duration_unit = u;
+                }
+                "reset_on_response" => {
+                    let bt = self.expect(TokenType::Identifier, "boolean value")?;
+                    match bt.value.as_str() {
+                        "true" => reset = Some(true),
+                        "false" => reset = Some(false),
+                        _ => {
+                            return Err(DslError::parse(
+                                format!("expected 'true' or 'false', got '{}'", bt.value),
+                                SourceSpan::new(bt.line, bt.col),
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown TO kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+            if self.at(TokenType::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on TO")?;
+        let duration = duration.ok_or_else(|| {
+            DslError::parse(
+                "TIMEOUT_MISSING_DURATION",
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        let reset_on_response = reset.ok_or_else(|| {
+            DslError::parse(
+                "TIMEOUT_MISSING_RESET_RULE",
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        Ok(ScheduleExpr::TimeoutWrapped(TimeoutWrapped {
+            inner: Box::new(inner),
+            timeout: Timeout {
+                duration,
+                duration_unit,
+                reset_on_response,
+            },
+        }))
+    }
+
+    fn parse_response_cost_postfix(&mut self, inner: ScheduleExpr) -> Result<ScheduleExpr> {
+        let name_tok = self.advance();
+        self.expect(TokenType::LParen, "ResponseCost opening paren")?;
+        let mut amount: Option<f64> = None;
+        let mut unit: String = ResponseCost::DEFAULT_UNIT.into();
+        let mut seen: Vec<String> = Vec::new();
+        while !self.at(TokenType::RParen) {
+            let key = self.expect(TokenType::Identifier, "ResponseCost kwarg name")?;
+            if seen.iter().any(|s| s == &key.value) {
+                return Err(DslError::parse(
+                    format!("RESPONSE_COST_DUPLICATE_KWARG: '{}'", key.value),
+                    SourceSpan::new(key.line, key.col),
+                ));
+            }
+            seen.push(key.value.clone());
+            self.expect(TokenType::Equals, "= after ResponseCost kwarg")?;
+            match key.value.as_str() {
+                "amount" => {
+                    let nt = self.expect(TokenType::Number, "amount value")?;
+                    let v: f64 = nt.value.parse().map_err(|_| {
+                        DslError::parse(
+                            format!("invalid amount: {}", nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        )
+                    })?;
+                    if v <= 0.0 {
+                        return Err(DslError::parse(
+                            format!("RESPONSE_COST_NONPOSITIVE_AMOUNT: {}", v),
+                            SourceSpan::new(key.line, key.col),
+                        ));
+                    }
+                    amount = Some(v);
+                }
+                "unit" => {
+                    let ut = self.expect(TokenType::StringLiteral, "unit string")?;
+                    unit = ut.value;
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown ResponseCost kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
+            }
+            if self.at(TokenType::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TokenType::RParen, "closing ) on ResponseCost")?;
+        let amount = amount.ok_or_else(|| {
+            DslError::parse(
+                "RESPONSE_COST_MISSING_AMOUNT",
+                SourceSpan::new(name_tok.line, name_tok.col),
+            )
+        })?;
+        Ok(ScheduleExpr::ResponseCostWrapped(ResponseCostWrapped {
+            inner: Box::new(inner),
+            response_cost: ResponseCost { amount, unit },
+        }))
     }
 
     fn parse_base_schedule(&mut self) -> Result<ScheduleExpr> {
