@@ -15,6 +15,8 @@ pub mod tokens;
 
 pub use errors::{DslError, DslErrorKind, Result, SourceSpan};
 pub use lexer::tokenize;
-pub use parser::parse;
-pub use serializer::{expr_to_json, json_to_string, program_to_json};
+pub use parser::{parse, parse_top_level, TopLevel};
+pub use serializer::{
+    expr_to_json, json_to_string, paper_to_json, phase_sequence_to_json, program_to_json,
+};
 pub use tokens::{Token, TokenType};

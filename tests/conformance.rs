@@ -13,7 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use contingency_dsl::ast::JsonValue as AstValue;
-use contingency_dsl::{parse, program_to_json};
+use contingency_dsl::{
+    paper_to_json, parse_top_level, phase_sequence_to_json, program_to_json, TopLevel,
+};
 use serde_json::Value as JsonV;
 
 fn conformance_root() -> PathBuf {
@@ -156,15 +158,20 @@ fn conformance_coverage_report() {
             covered += 1;
             stats.total += 1;
 
-            let program = match parse(input) {
-                Ok(p) => p,
+            let top = match parse_top_level(input) {
+                Ok(t) => t,
                 Err(_) => {
                     stats.parse_err += 1;
                     continue;
                 }
             };
             stats.parse_ok += 1;
-            let got = ast_value_to_serde(&program_to_json(&program));
+            let got_ast = match &top {
+                TopLevel::Program(p) => program_to_json(p),
+                TopLevel::PhaseSequence(s) => phase_sequence_to_json(s),
+                TopLevel::Paper(p) => paper_to_json(p),
+            };
+            let got = ast_value_to_serde(&got_ast);
             if json_subset(&got, &want) {
                 stats.shape_match += 1;
                 passed += 1;

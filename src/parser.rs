@@ -37,10 +37,37 @@ use crate::lexer::tokenize;
 use crate::serializer::expr_to_json;
 use crate::tokens::{Token, TokenType};
 
+/// Top-level AST root: a single-schedule Program, a PhaseSequence produced by
+/// phase / shaping / progressive blocks, or a Paper wrapping multiple
+/// Experiments.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TopLevel {
+    Program(Program),
+    PhaseSequence(crate::experiment::PhaseSequence),
+    Paper(crate::experiment::Paper),
+}
+
+/// Parse DSL source text. Back-compat wrapper that returns a Program for the
+/// single-schedule form and an error for phase-sequence / paper inputs; use
+/// [`parse_top_level`] to accept all top-level forms.
 pub fn parse(source: &str) -> Result<Program> {
+    match parse_top_level(source)? {
+        TopLevel::Program(p) => Ok(p),
+        TopLevel::PhaseSequence(_) => Err(DslError::parse(
+            "input parsed as a phase sequence — use parse_top_level()",
+            SourceSpan::new(1, 1),
+        )),
+        TopLevel::Paper(_) => Err(DslError::parse(
+            "input parsed as a paper — use parse_top_level()",
+            SourceSpan::new(1, 1),
+        )),
+    }
+}
+
+pub fn parse_top_level(source: &str) -> Result<TopLevel> {
     let tokens = tokenize(source)?;
     let mut p = Parser::new(tokens);
-    p.parse_program()
+    p.parse_top_level()
 }
 
 pub struct Parser {
@@ -96,26 +123,35 @@ impl Parser {
         }
     }
 
-    fn parse_program(&mut self) -> Result<Program> {
+    fn parse_top_level(&mut self) -> Result<TopLevel> {
         self.skip_newlines();
-
         let mut program_annotations: Vec<Annotation> = Vec::new();
         while self.at(TokenType::At) {
             program_annotations.push(self.parse_annotation()?);
             self.skip_newlines();
         }
-
+        if self.at(TokenType::Phase) {
+            let seq = self.parse_phase_sequence(program_annotations)?;
+            return Ok(TopLevel::PhaseSequence(seq));
+        }
         if self.at_any(&[
             TokenType::Experiment,
-            TokenType::Phase,
             TokenType::Shaping,
             TokenType::Progressive,
         ]) {
             return Err(DslError::parse(
-                "experiment-layer blocks not yet supported by rs parser",
+                "experiment / shaping / progressive blocks not yet supported by rs parser",
                 SourceSpan::new(self.peek().line, self.peek().col),
             ));
         }
+        let p = self.parse_program_body(program_annotations)?;
+        Ok(TopLevel::Program(p))
+    }
+
+    fn parse_program_body(
+        &mut self,
+        program_annotations: Vec<Annotation>,
+    ) -> Result<Program> {
 
         let mut param_decls = Vec::new();
         while self.at_any(&[TokenType::Lh, TokenType::Rd, TokenType::KwArgName]) {
@@ -158,6 +194,150 @@ impl Parser {
             param_decls,
             bindings,
             schedule: ProgramSchedule::Operant(schedule),
+        })
+    }
+
+    fn parse_phase_sequence(
+        &mut self,
+        program_annotations: Vec<Annotation>,
+    ) -> Result<crate::experiment::PhaseSequence> {
+        let mut phases: Vec<crate::experiment::Phase> = Vec::new();
+        while self.at(TokenType::Phase) {
+            phases.push(self.parse_phase_block()?);
+            self.skip_newlines();
+        }
+        if !self.at(TokenType::Eof) {
+            let t = self.peek();
+            return Err(DslError::parse(
+                format!(
+                    "unexpected token after phase sequence: {:?} '{}'",
+                    t.ty, t.value
+                ),
+                SourceSpan::new(t.line, t.col),
+            ));
+        }
+        Ok(crate::experiment::PhaseSequence {
+            phases,
+            program_annotations,
+        })
+    }
+
+    fn parse_phase_block(&mut self) -> Result<crate::experiment::Phase> {
+        self.expect(TokenType::Phase, "phase")?;
+        let label_tok = self.expect(TokenType::Identifier, "phase label")?;
+        self.expect(TokenType::Colon, ": after phase label")?;
+        self.skip_newlines();
+
+        // Body consists of optional criterion lines (`sessions = N` or
+        // `sessions >= N`), optional stable(...) line, schedule-level
+        // annotations, and one schedule expression. Each line is separated
+        // by Newline.
+        let mut criterion: Option<crate::experiment::Criterion> = None;
+        let mut min_sessions: Option<i64> = None;
+        let mut phase_annotations: Vec<Annotation> = Vec::new();
+
+        loop {
+            self.skip_newlines();
+            if self.at(TokenType::Sessions) {
+                self.advance();
+                if self.at(TokenType::Equals) {
+                    self.advance();
+                    let nt = self.expect(TokenType::Number, "sessions count")?;
+                    let n: i64 = nt.value.parse().map_err(|_| {
+                        DslError::parse(
+                            format!("invalid sessions: {}", nt.value),
+                            SourceSpan::new(nt.line, nt.col),
+                        )
+                    })?;
+                    criterion = Some(crate::experiment::Criterion::FixedSessions(
+                        crate::experiment::FixedSessions { count: n },
+                    ));
+                } else if self.at(TokenType::Gte) {
+                    self.advance();
+                    let nt = self.expect(TokenType::Number, "min sessions")?;
+                    min_sessions = Some(nt.value.parse().unwrap_or(0));
+                } else {
+                    let t = self.peek();
+                    return Err(DslError::parse(
+                        format!(
+                            "expected '=' or '>=' after 'sessions', got {:?} '{}'",
+                            t.ty, t.value
+                        ),
+                        SourceSpan::new(t.line, t.col),
+                    ));
+                }
+                self.skip_newlines();
+                continue;
+            }
+            if self.at(TokenType::Stable) {
+                self.advance();
+                self.expect(TokenType::LParen, "( after stable")?;
+                let method_tok =
+                    self.expect(TokenType::Identifier, "stability method")?;
+                let mut window_sessions: Option<i64> = None;
+                let mut max_change_pct: Option<f64> = None;
+                let mut measure: Option<String> = None;
+                while self.at(TokenType::Comma) {
+                    self.advance();
+                    let key = self.expect(TokenType::Identifier, "stable kwarg")?;
+                    self.expect(TokenType::Equals, "=")?;
+                    match key.value.as_str() {
+                        "window" => {
+                            let nt = self.expect(TokenType::Number, "window")?;
+                            window_sessions = Some(nt.value.parse().unwrap_or(0));
+                        }
+                        "threshold" => {
+                            let nt = self.expect(TokenType::Number, "threshold")?;
+                            let v: f64 = nt.value.parse().unwrap_or(0.0);
+                            if self.at(TokenType::Percent) {
+                                self.advance();
+                            }
+                            max_change_pct = Some(v);
+                        }
+                        "measure" => {
+                            let vt = self.expect(TokenType::Identifier, "measure value")?;
+                            measure = Some(vt.value);
+                        }
+                        _ => {
+                            return Err(DslError::parse(
+                                format!("unknown stable kwarg '{}'", key.value),
+                                SourceSpan::new(key.line, key.col),
+                            ))
+                        }
+                    }
+                }
+                self.expect(TokenType::RParen, ") on stable")?;
+                criterion = Some(crate::experiment::Criterion::Stability(
+                    crate::experiment::Stability {
+                        method: method_tok.value,
+                        window_sessions,
+                        max_change_pct,
+                        min_sessions,
+                        measure,
+                    },
+                ));
+                self.skip_newlines();
+                continue;
+            }
+            if self.at(TokenType::At) {
+                phase_annotations.push(self.parse_annotation()?);
+                self.skip_newlines();
+                continue;
+            }
+            break;
+        }
+
+        let schedule = self.parse_schedule()?;
+        self.skip_newlines();
+
+        let criterion = criterion.unwrap_or(crate::experiment::Criterion::ExperimenterJudgment(
+            crate::experiment::ExperimenterJudgment,
+        ));
+        Ok(crate::experiment::Phase {
+            label: label_tok.value,
+            schedule: crate::experiment::PhaseSchedule::Operant(schedule),
+            criterion,
+            annotations: phase_annotations,
         })
     }
 
