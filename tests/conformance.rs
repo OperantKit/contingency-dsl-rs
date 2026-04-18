@@ -2,11 +2,16 @@
 //! `../contingency-dsl/conformance/**/*.json` and report which cases this
 //! implementation currently matches.
 //!
-//! The harness never fails a case with `expected_error` or `expected_warning`
-//! (those channels are out of scope until the error-code layer lands). For
-//! cases whose `expected` payload this implementation does not yet produce,
-//! the failure is counted and attributed to the originating file so future
-//! sessions can target the largest gaps first.
+//! The harness checks four conformance channels:
+//!
+//! 1. shape match — fixtures with `expected` or `pre_expansion` must parse
+//!    successfully and produce the matching JSON shape under subset
+//!    comparison;
+//! 2. error channel — fixtures with an `error` object (or `expected_error`)
+//!    must produce a DslError whose `kind` and `code` match;
+//! 3. warning channel — fixtures with a `warnings` list must accumulate a
+//!    diagnostic containing each listed code during analyzer expansion;
+//! 4. algebraic fixtures (`lhs` / `rhs` / `relation`) are skipped.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -40,12 +45,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem == "errors" || stem == "warnings" {
+            // Skip representations/ — it has its own test module in py
+            // (t-tau conversion) and is not in scope for this harness.
+            if path.file_name().and_then(|s| s.to_str()) == Some("representations") {
                 continue;
             }
+            walk(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
             out.push(path);
         }
     }
@@ -96,14 +102,18 @@ fn json_subset(actual: &JsonV, expected: &JsonV) -> bool {
 
 #[derive(Default)]
 struct Stats {
-    total: usize,
-    parse_ok: usize,
+    // Shape channel
+    shape_total: usize,
     shape_match: usize,
-    parse_err: usize,
-    shape_mismatch: usize,
-    skipped_error: usize,
-    skipped_warning: usize,
-    per_file: BTreeMap<String, (usize, usize)>, // (passed, total-covered)
+    // Error channel
+    error_total: usize,
+    error_match: usize,
+    // Warning channel
+    warning_total: usize,
+    warning_match: usize,
+    // Per-file breakdown: (shape_pass, shape_total, error_pass, error_total,
+    // warning_pass, warning_total)
+    per_file: BTreeMap<String, (usize, usize, usize, usize, usize, usize)>,
 }
 
 #[test]
@@ -134,39 +144,85 @@ fn conformance_coverage_report() {
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        let mut covered = 0usize;
-        let mut passed = 0usize;
+        let mut row = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
 
         for case in cases {
             let JsonV::Object(obj) = case else { continue };
             let Some(JsonV::String(input)) = obj.get("input") else { continue };
-            // rs parser has no analyzer yet, so prefer `pre_expansion` (raw
-            // parse output) over `expected` (post-analysis) when both exist.
-            let want_opt = obj
+            // Algebraic equivalence fixtures are skipped (py runs them
+            // through a separate comparator).
+            if obj.contains_key("lhs") && obj.contains_key("rhs") {
+                continue;
+            }
+
+            // Error channel: fixture has an `error` object or `expected_error`.
+            let error_info = normalize_error(&obj);
+            let expected_warnings = normalize_warnings(&obj);
+            let want_shape = obj
                 .get("pre_expansion")
                 .or_else(|| obj.get("expected"))
                 .cloned();
-            if obj.contains_key("expected_error") {
-                stats.skipped_error += 1;
-                continue;
-            }
-            let Some(want) = want_opt else {
-                if obj.contains_key("expected_warning") {
-                    stats.skipped_warning += 1;
+
+            if let Some((etype, ecode)) = error_info {
+                stats.error_total += 1;
+                row.3 += 1;
+                let parse_result = parse_top_level(input);
+                let matched = match parse_result {
+                    Err(e) => {
+                        let kind_ok = etype.is_empty() || e.kind_str() == etype;
+                        let code_ok = ecode
+                            .as_deref()
+                            .map(|want| e.code().map_or(false, |c| c == want))
+                            .unwrap_or(true);
+                        kind_ok && code_ok
+                    }
+                    Ok(top) => {
+                        // Parse succeeded; try analyzer-reported warnings
+                        // as a secondary channel (some fixtures tag
+                        // SemanticError codes that surface at the analyzer
+                        // pass, not parse).
+                        let diags = collect_diagnostics(&top);
+                        ecode
+                            .as_deref()
+                            .map(|want| diags.iter().any(|d| d == want))
+                            .unwrap_or(false)
+                    }
+                };
+                if matched {
+                    stats.error_match += 1;
+                    row.2 += 1;
                 }
                 continue;
+            }
+
+            if !expected_warnings.is_empty() {
+                stats.warning_total += 1;
+                row.5 += 1;
+                let diags = match parse_top_level(input) {
+                    Ok(top) => collect_diagnostics(&top),
+                    Err(_) => Vec::new(),
+                };
+                let matched = expected_warnings
+                    .iter()
+                    .all(|code| diags.iter().any(|d| d == code));
+                if matched {
+                    stats.warning_match += 1;
+                    row.4 += 1;
+                }
+                // Fall through — some warning fixtures also have an
+                // `expected` shape that should be verified.
+            }
+
+            let Some(want) = want_shape else {
+                continue;
             };
-            covered += 1;
-            stats.total += 1;
+            stats.shape_total += 1;
+            row.1 += 1;
 
             let top = match parse_top_level(input) {
                 Ok(t) => t,
-                Err(_) => {
-                    stats.parse_err += 1;
-                    continue;
-                }
+                Err(_) => continue,
             };
-            stats.parse_ok += 1;
             let got_ast = match &top {
                 TopLevel::Program(p) => program_to_json(p),
                 TopLevel::PhaseSequence(s) => phase_sequence_to_json(s),
@@ -174,11 +230,6 @@ fn conformance_coverage_report() {
             };
             let got = ast_value_to_serde(&got_ast);
             let mut matched = json_subset(&got, &want);
-            // If the primary match (pre_expansion if available, else
-            // expected) failed, try applying binding expansion and compare
-            // against the post-analysis `expected` shape. This lets
-            // fixtures that only carry `expected` (no pre_expansion) pass
-            // once binding expansion runs.
             if !matched {
                 if let (TopLevel::Program(p), Some(expected_val)) =
                     (&top, obj.get("expected"))
@@ -192,29 +243,89 @@ fn conformance_coverage_report() {
             }
             if matched {
                 stats.shape_match += 1;
-                passed += 1;
-            } else {
-                stats.shape_mismatch += 1;
+                row.0 += 1;
             }
         }
 
+        let covered = row.1 + row.3 + row.5;
         if covered > 0 {
-            stats.per_file.insert(rel, (passed, covered));
+            stats.per_file.insert(rel, row);
         }
     }
 
     eprintln!();
     eprintln!("== contingency-dsl-rs conformance report ==");
-    eprintln!("total covered cases: {}", stats.total);
-    eprintln!("  parse ok        : {}", stats.parse_ok);
-    eprintln!("  shape match     : {}", stats.shape_match);
-    eprintln!("  parse errors    : {}", stats.parse_err);
-    eprintln!("  shape mismatches: {}", stats.shape_mismatch);
-    eprintln!("  skipped (errors)  : {}", stats.skipped_error);
-    eprintln!("  skipped (warnings): {}", stats.skipped_warning);
+    eprintln!("shape channel   : {} / {}", stats.shape_match, stats.shape_total);
+    eprintln!("error channel   : {} / {}", stats.error_match, stats.error_total);
+    eprintln!("warning channel : {} / {}", stats.warning_match, stats.warning_total);
+    eprintln!(
+        "grand total     : {} / {}",
+        stats.shape_match + stats.error_match + stats.warning_match,
+        stats.shape_total + stats.error_total + stats.warning_total
+    );
     eprintln!();
-    eprintln!("per-file pass rate:");
-    for (file, (pass, total)) in &stats.per_file {
-        eprintln!("  {:>4}/{:>4}  {}", pass, total, file);
+    eprintln!("per-file pass rate (shape | error | warning):");
+    for (file, (sp, st, ep, et, wp, wt)) in &stats.per_file {
+        let seg = |p: usize, t: usize| {
+            if t == 0 {
+                "     -".to_string()
+            } else {
+                format!("{:>3}/{:>3}", p, t)
+            }
+        };
+        eprintln!(
+            "  {} | {} | {}   {}",
+            seg(*sp, *st),
+            seg(*ep, *et),
+            seg(*wp, *wt),
+            file
+        );
+    }
+}
+
+fn normalize_error(obj: &serde_json::Map<String, JsonV>) -> Option<(String, Option<String>)> {
+    // Shorthand: "error": "ParseError" or { "type": "...", "code": "..." }.
+    if let Some(v) = obj.get("error") {
+        match v {
+            JsonV::String(s) => return Some((s.clone(), None)),
+            JsonV::Object(m) => {
+                let etype = m
+                    .get("type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ecode = m.get("code").and_then(|x| x.as_str()).map(str::to_string);
+                return Some((etype, ecode));
+            }
+            _ => {}
+        }
+    }
+    if let Some(JsonV::String(code)) = obj.get("expected_error") {
+        return Some((String::new(), Some(code.clone())));
+    }
+    None
+}
+
+fn normalize_warnings(obj: &serde_json::Map<String, JsonV>) -> Vec<String> {
+    let pick = obj
+        .get("warnings")
+        .or_else(|| obj.get("expected_warnings"))
+        .or_else(|| obj.get("expected_warning"))
+        .or_else(|| obj.get("warning"));
+    match pick {
+        Some(JsonV::Array(xs)) => xs
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        Some(JsonV::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn collect_diagnostics(top: &TopLevel) -> Vec<String> {
+    match top {
+        TopLevel::Program(p) => contingency_dsl::collect_warnings(p),
+        TopLevel::PhaseSequence(s) => s.warnings.clone(),
+        TopLevel::Paper(_) => Vec::new(),
     }
 }

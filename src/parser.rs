@@ -73,11 +73,12 @@ pub fn parse_top_level(source: &str) -> Result<TopLevel> {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    warnings: Vec<String>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, warnings: Vec::new() }
     }
 
     pub(crate) fn peek(&self) -> &Token {
@@ -348,6 +349,7 @@ impl Parser {
         Ok(crate::experiment::PhaseSequence {
             phases,
             program_annotations,
+            warnings: std::mem::take(&mut self.warnings),
         })
     }
 
@@ -361,6 +363,7 @@ impl Parser {
         let mut step_maps: Vec<(String, Vec<f64>)> = Vec::new();
         let mut user_criterion: Option<crate::experiment::Criterion> = None;
         let mut min_sessions: Option<i64> = None;
+        let mut has_advance = false;
         loop {
             self.skip_newlines();
             if self.at(TokenType::Steps) {
@@ -444,12 +447,22 @@ impl Parser {
                 // `advance when criterion(...)` / `all(...)` / `manual`.
                 // Currently recorded in the AST via shared_annotations is not
                 // implemented; skip tokens until newline.
+                has_advance = true;
                 while !self.at(TokenType::Newline) && !self.at(TokenType::Eof) {
                     self.advance();
                 }
                 continue;
             }
             break;
+        }
+        if has_advance {
+            // Warn when a progressive block specifies an advance condition
+            // but has only one step — the advance condition is vacuous.
+            if step_maps.first().map_or(false, |(_, v)| v.len() == 1) {
+                if !self.warnings.iter().any(|w| w == "ADVANCE_SINGLE_STEP") {
+                    self.warnings.push("ADVANCE_SINGLE_STEP".into());
+                }
+            }
         }
         if user_criterion.is_none() {
             if let Some(n) = min_sessions {
@@ -2922,6 +2935,439 @@ fn canonical_annotation_keyword(kw: &str) -> Option<&'static str> {
     }
 }
 
+/// Collect analyzer-surface warning codes for the given program. Mirrors a
+/// subset of the `contingency_dsl.analyzer` warning channel. Currently
+/// reports:
+///
+/// - `MISSING_TIME_UNIT`: an Atomic with Interval or Time domain that was
+///   written without an explicit time unit.
+/// - `MISSING_COD`: a Conc compound without any COD parameter.
+/// - `MISSING_INTERPOLATE_ONSET`: an Interpolate compound with `count` but
+///   without `onset`.
+/// - `VACUOUS_LH_RATIO`: a LimitedHold wrapping a leaf Atomic whose domain
+///   is Ratio (LH is vacuous for response-count-driven schedules).
+/// - `MISSING_BRIEF`: a Modifier Pctl without a preceding `@brief` scope.
+///   (Currently never emitted; placeholder for the analyzer pass.)
+/// - `MISSING_ESCAPE_MAXSHOCK`: an Escape aversive schedule without a
+///   `MaxShock` parameter.
+/// - `RSI_EXCEEDS_SSI`: Sidman with RSI > SSI.
+/// - `LAG_LARGE_N`: Lag with a value > 20 (heuristic sanity check).
+/// - `ESCAPE_MAX_TOO_SHORT`: Escape with MaxShock < SafeDuration.
+/// - `REDUNDANT_DIRECTIONAL_COD`: Directional COD entries that collapse to a
+///   single scalar (all same value).
+pub fn collect_warnings(program: &Program) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let has_prog_lh = program.param_decls.iter().any(|p| p.name == "LH");
+    // Program-level RD_LARGE_DELAY warning.
+    if let Some(pd) = program.param_decls.iter().find(|p| p.name == "RD") {
+        let seconds = match pd.time_unit.as_deref() {
+            Some("s") => pd.value,
+            Some("ms") => pd.value / 1000.0,
+            Some("min") => pd.value * 60.0,
+            _ => pd.value,
+        };
+        if seconds > 30.0 {
+            push_unique(&mut out, "RD_LARGE_DELAY");
+        }
+    }
+    // Stimulus-class context: @stimulus_classes or @training(relations=...).
+    // Look both in program-scope and schedule-scope annotations so the
+    // `MTS(...) @stimulus_classes(3)` surface form counts.
+    let mut has_stim_classes = program.program_annotations.iter().any(is_stim_class_ann);
+    if let ProgramSchedule::Operant(expr) = &program.schedule {
+        if schedule_has_stim_class(expr) {
+            has_stim_classes = true;
+        }
+    }
+    // Token context is established by a program-level @reinforcer("token")
+    // or @reinforcer(type="token"/"point") / @reinforcer(..., unit="point").
+    // Without it, any ResponseCost wrapping triggers RC_WITHOUT_TOKEN_CONTEXT.
+    let token_context = program.program_annotations.iter().any(|a| {
+        a.keyword == "reinforcer"
+            && (matches!(&a.positional, Some(crate::ast::AnnotationValue::Str(s)) if s == "token" || s == "point")
+                || a.params.as_ref().map_or(false, |p| {
+                    matches!(p.get("type"), Some(crate::ast::AnnotationValue::Str(s)) if s == "conditioned" || s == "token" || s == "point")
+                        || matches!(p.get("unit"), Some(crate::ast::AnnotationValue::Str(s)) if s == "token" || s == "point")
+                }))
+    });
+    let expanded = expand_bindings(program.clone());
+    if let ProgramSchedule::Operant(expr) = &expanded.schedule {
+        scan_warnings(expr, &mut out);
+        scan_trial_based_warnings(expr, has_stim_classes, &mut out);
+        if has_prog_lh && contains_ratio_leaf(expr) {
+            push_unique(&mut out, "VACUOUS_LH_RATIO");
+        }
+        if !token_context && contains_response_cost(expr) {
+            push_unique(&mut out, "RC_WITHOUT_TOKEN_CONTEXT");
+        }
+    }
+    out
+}
+
+fn scan_trial_based_warnings(
+    expr: &ScheduleExpr,
+    has_stim_classes: bool,
+    out: &mut Vec<String>,
+) {
+    match expr {
+        ScheduleExpr::TrialBased(tb) => {
+            use crate::ast::TrialParam;
+            if tb.trial_type == "MTS" {
+                if let Some(TrialParam::Int(n)) = tb.params.get("comparisons") {
+                    if *n == 2 {
+                        push_unique(out, "MTS_TWO_COMPARISONS_WEAK");
+                    }
+                    if *n >= 10 {
+                        push_unique(out, "MTS_MANY_COMPARISONS");
+                    }
+                }
+                if let (Some(TrialParam::Float(iti)), Some(TrialParam::Str(u))) =
+                    (tb.params.get("ITI"), tb.params.get("ITI_unit"))
+                {
+                    let iti_seconds = match u.as_str() {
+                        "ms" => iti / 1000.0,
+                        "min" => iti * 60.0,
+                        _ => *iti,
+                    };
+                    if iti_seconds < 1.0 {
+                        push_unique(out, "MTS_SHORT_ITI");
+                    }
+                }
+                if let (Some(TrialParam::Float(lh)), Some(TrialParam::Str(u))) = (
+                    tb.params.get("limitedHold"),
+                    tb.params.get("limitedHoldUnit"),
+                ) {
+                    let lh_seconds = match u.as_str() {
+                        "ms" => lh / 1000.0,
+                        "min" => lh * 60.0,
+                        _ => *lh,
+                    };
+                    if lh_seconds > 300.0 {
+                        push_unique(out, "MTS_LONG_LH");
+                    }
+                }
+                if let (Some(TrialParam::Float(d)), Some(TrialParam::Str(u))) =
+                    (tb.params.get("delay"), tb.params.get("delay_unit"))
+                {
+                    let delay_seconds = match u.as_str() {
+                        "ms" => d / 1000.0,
+                        "min" => d * 60.0,
+                        _ => *d,
+                    };
+                    if delay_seconds > 30.0 {
+                        push_unique(out, "MTS_LONG_DELAY");
+                    }
+                    if delay_seconds > 0.0 && tb.params.contains_key("correction") {
+                        push_unique(out, "DMTS_WITH_CORRECTION");
+                    }
+                }
+                if matches!(
+                    tb.params.get("consequence"),
+                    Some(TrialParam::Schedule(s)) if matches!(s.as_ref(), ScheduleExpr::Special(sp) if matches!(sp.kind, SpecialKind::Ext))
+                ) {
+                    push_unique(out, "MTS_NO_REINFORCEMENT");
+                }
+                let mts_type = match tb.params.get("mts_type") {
+                    Some(TrialParam::Str(s)) => s.as_str(),
+                    _ => "",
+                };
+                if mts_type == "identity" && has_stim_classes {
+                    push_unique(out, "MTS_IDENTITY_WITH_CLASSES");
+                }
+                if mts_type == "arbitrary" && !has_stim_classes {
+                    push_unique(out, "MTS_ARBITRARY_WITHOUT_CLASSES");
+                }
+            }
+            if tb.trial_type == "GoNoGo" && tb.params.contains_key("limitedHold") {
+                push_unique(out, "GONOGO_LH_REDUNDANT");
+            }
+        }
+        ScheduleExpr::TimeoutWrapped(tw) => {
+            if matches!(
+                tw.inner.as_ref(),
+                ScheduleExpr::Special(s) if matches!(s.kind, SpecialKind::Ext)
+            ) {
+                push_unique(out, "TO_ON_EXT");
+            }
+            scan_trial_based_warnings(&tw.inner, has_stim_classes, out);
+        }
+        ScheduleExpr::Compound(c) => {
+            for comp in &c.components {
+                scan_trial_based_warnings(comp, has_stim_classes, out);
+            }
+        }
+        ScheduleExpr::LimitedHold(lh) => {
+            if let ScheduleExpr::TrialBased(tb) = lh.inner.as_ref() {
+                if tb.trial_type == "MTS" {
+                    let lh_seconds = match lh.time_unit.as_deref() {
+                        Some("ms") => lh.hold_duration / 1000.0,
+                        Some("min") => lh.hold_duration * 60.0,
+                        _ => lh.hold_duration,
+                    };
+                    if lh_seconds > 300.0 {
+                        push_unique(out, "MTS_LONG_LH");
+                    }
+                }
+                if tb.trial_type == "GoNoGo" {
+                    push_unique(out, "GONOGO_LH_REDUNDANT");
+                }
+            }
+            scan_trial_based_warnings(&lh.inner, has_stim_classes, out);
+        }
+        ScheduleExpr::Modifier(m) => {
+            if let Some(inner) = &m.inner {
+                scan_trial_based_warnings(inner, has_stim_classes, out);
+            }
+        }
+        ScheduleExpr::Annotated(boxed) => {
+            scan_trial_based_warnings(&boxed.expr, has_stim_classes, out);
+        }
+        _ => {}
+    }
+}
+
+fn contains_response_cost(expr: &ScheduleExpr) -> bool {
+    match expr {
+        ScheduleExpr::ResponseCostWrapped(_) => true,
+        ScheduleExpr::Compound(c) => c.components.iter().any(contains_response_cost),
+        ScheduleExpr::Modifier(m) => m.inner.as_deref().map_or(false, contains_response_cost),
+        ScheduleExpr::LimitedHold(lh) => contains_response_cost(&lh.inner),
+        ScheduleExpr::TimeoutWrapped(tw) => contains_response_cost(&tw.inner),
+        ScheduleExpr::Annotated(boxed) => contains_response_cost(&boxed.expr),
+        _ => false,
+    }
+}
+
+fn is_stim_class_ann(a: &Annotation) -> bool {
+    a.keyword == "stimulus_classes"
+        || (a.keyword == "training"
+            && a.params
+                .as_ref()
+                .map_or(false, |p| p.contains_key("relations")))
+        || (a.keyword == "testing"
+            && a.params
+                .as_ref()
+                .map_or(false, |p| p.contains_key("relations")))
+}
+
+fn schedule_has_stim_class(expr: &ScheduleExpr) -> bool {
+    match expr {
+        ScheduleExpr::Annotated(boxed) => {
+            boxed.annotations.iter().any(is_stim_class_ann)
+                || schedule_has_stim_class(&boxed.expr)
+        }
+        ScheduleExpr::Compound(c) => c.components.iter().any(schedule_has_stim_class),
+        ScheduleExpr::LimitedHold(lh) => schedule_has_stim_class(&lh.inner),
+        ScheduleExpr::Modifier(m) => m.inner.as_deref().map_or(false, schedule_has_stim_class),
+        ScheduleExpr::TimeoutWrapped(tw) => schedule_has_stim_class(&tw.inner),
+        ScheduleExpr::ResponseCostWrapped(rw) => schedule_has_stim_class(&rw.inner),
+        _ => false,
+    }
+}
+
+fn contains_ratio_leaf(expr: &ScheduleExpr) -> bool {
+    use crate::enums::Domain;
+    match expr {
+        ScheduleExpr::Atomic(a) => a.schedule_type.domain == Domain::Ratio,
+        ScheduleExpr::Compound(c) => c.components.iter().any(contains_ratio_leaf),
+        ScheduleExpr::Modifier(m) => m.inner.as_deref().map_or(false, contains_ratio_leaf),
+        ScheduleExpr::LimitedHold(lh) => contains_ratio_leaf(&lh.inner),
+        ScheduleExpr::TimeoutWrapped(tw) => contains_ratio_leaf(&tw.inner),
+        ScheduleExpr::ResponseCostWrapped(rw) => contains_ratio_leaf(&rw.inner),
+        ScheduleExpr::Annotated(boxed) => contains_ratio_leaf(&boxed.expr),
+        _ => false,
+    }
+}
+
+fn scan_warnings(expr: &ScheduleExpr, out: &mut Vec<String>) {
+    match expr {
+        ScheduleExpr::Atomic(a) => {
+            use crate::enums::Domain;
+            if matches!(a.schedule_type.domain, Domain::Interval | Domain::Time)
+                && a.time_unit.is_none()
+            {
+                push_unique(out, "MISSING_TIME_UNIT");
+            }
+        }
+        ScheduleExpr::Compound(c) => {
+            use crate::enums::Combinator;
+            if c.combinator == Combinator::Conc {
+                let has_cod = c
+                    .params
+                    .as_ref()
+                    .map_or(false, |p| p.contains_key("COD"));
+                if !has_cod {
+                    push_unique(out, "MISSING_COD");
+                }
+                if let Some(params) = &c.params {
+                    if let Some(CombinatorParamValue::Directional(dcod)) =
+                        params.get("COD")
+                    {
+                        let all_same_value = dcod
+                            .directional
+                            .windows(2)
+                            .all(|pair| pair[0].value == pair[1].value);
+                        if dcod.base.is_none()
+                            && !dcod.directional.is_empty()
+                            && all_same_value
+                        {
+                            push_unique(out, "REDUNDANT_DIRECTIONAL_COD");
+                        }
+                    }
+                }
+            }
+            if c.combinator == Combinator::Interpolate {
+                if let Some(params) = &c.params {
+                    if params.contains_key("count") && !params.contains_key("onset") {
+                        push_unique(out, "MISSING_INTERPOLATE_ONSET");
+                    }
+                }
+            }
+            for comp in &c.components {
+                scan_warnings(comp, out);
+            }
+        }
+        ScheduleExpr::LimitedHold(lh) => {
+            use crate::enums::Domain;
+            if let ScheduleExpr::Atomic(a) = lh.inner.as_ref() {
+                if a.schedule_type.domain == Domain::Ratio {
+                    push_unique(out, "VACUOUS_LH_RATIO");
+                }
+            }
+            scan_warnings(&lh.inner, out);
+        }
+        ScheduleExpr::Modifier(m) => {
+            // DR modifiers (DRL/DRH/DRO) carry a time value and warn when
+            // the time unit is omitted.
+            if matches!(
+                m.kind,
+                crate::ast::ModifierKind::Drl
+                    | crate::ast::ModifierKind::Drh
+                    | crate::ast::ModifierKind::Dro
+            ) && m.value.is_some()
+                && m.time_unit.is_none()
+            {
+                push_unique(out, "MISSING_TIME_UNIT");
+            }
+            // Pctl rank / window heuristics.
+            if m.kind == crate::ast::ModifierKind::Pctl {
+                if let Some(r) = m.pctl_rank {
+                    if r == 0 || r == 100 {
+                        push_unique(out, "PCTL_EXTREME_RANK");
+                    }
+                }
+                if let Some(w) = m.pctl_window {
+                    if w < 5 {
+                        push_unique(out, "PCTL_SMALL_WINDOW");
+                    }
+                    if w > 100 {
+                        push_unique(out, "PCTL_LARGE_WINDOW");
+                    }
+                }
+            }
+            if let Some(inner) = &m.inner {
+                scan_warnings(inner, out);
+            }
+        }
+        ScheduleExpr::AdjustingSchedule(adj) => {
+            if adj.adj_target == "delay" {
+                if adj.adj_min.is_none() && adj.adj_max.is_none() {
+                    push_unique(out, "ADJ_UNBOUNDED_DELAY");
+                }
+                if let Some(m) = &adj.adj_min {
+                    if m.value == 0.0 {
+                        push_unique(out, "ADJ_ZERO_MIN_DELAY");
+                    }
+                }
+            }
+            if adj.adj_step.value > adj.adj_start.value {
+                push_unique(out, "ADJ_LARGE_STEP");
+            }
+            if adj.adj_target == "ratio" {
+                if let Some(mn) = &adj.adj_min {
+                    if mn.value < 1.0 {
+                        push_unique(out, "ADJ_SUBUNIT_RATIO");
+                    }
+                }
+            }
+        }
+        ScheduleExpr::InterlockingSchedule(il) => {
+            if il.interlock_r0 == 1 {
+                push_unique(out, "INTERLOCK_TRIVIAL_RATIO");
+            }
+            if il.interlock_r0 > 500 {
+                push_unique(out, "INTERLOCK_LARGE_RATIO");
+            }
+        }
+        ScheduleExpr::SecondOrder(_) => {
+            // Second-order schedules are canonically used with a brief
+            // conditioned-reinforcer scope; emit MISSING_BRIEF when no
+            // matching annotation context is available.
+            push_unique(out, "MISSING_BRIEF");
+        }
+        ScheduleExpr::TimeoutWrapped(tw) => scan_warnings(&tw.inner, out),
+        ScheduleExpr::ResponseCostWrapped(rw) => scan_warnings(&rw.inner, out),
+        ScheduleExpr::Annotated(boxed) => scan_warnings(&boxed.expr, out),
+        ScheduleExpr::AversiveSchedule(av) => {
+            let ssi = aversive_seconds(av, "SSI");
+            let rsi = aversive_seconds(av, "RSI");
+            if let (Some(ssi), Some(rsi)) = (ssi, rsi) {
+                if rsi > ssi {
+                    push_unique(out, "RSI_EXCEEDS_SSI");
+                }
+            }
+            if matches!(av.kind, crate::ast::AversiveKind::Escape) {
+                let safe = aversive_seconds(av, "SafeDuration");
+                let max_shock = aversive_seconds(av, "MaxShock");
+                if max_shock.is_none() {
+                    push_unique(out, "MISSING_ESCAPE_MAXSHOCK");
+                }
+                if let (Some(s), Some(m)) = (safe, max_shock) {
+                    if m <= s {
+                        push_unique(out, "ESCAPE_MAX_TOO_SHORT");
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // Lag heuristic.
+    if let ScheduleExpr::Modifier(m) = expr {
+        if m.kind == crate::ast::ModifierKind::Lag {
+            if let Some(v) = m.value {
+                if v >= 51.0 {
+                    push_unique(out, "LAG_LARGE_N");
+                }
+            }
+        }
+    }
+}
+
+fn aversive_seconds(
+    av: &crate::ast::AversiveSchedule,
+    name: &str,
+) -> Option<f64> {
+    use crate::ast::AversiveParam;
+    match av.params.get(name)? {
+        AversiveParam::Numeric(n) => {
+            let factor = match n.time_unit.as_deref() {
+                Some("s") => 1.0,
+                Some("ms") => 0.001,
+                Some("min") => 60.0,
+                _ => 1.0,
+            };
+            Some(n.value * factor)
+        }
+        _ => None,
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, code: &str) {
+    if !out.iter().any(|s| s == code) {
+        out.push(code.into());
+    }
+}
+
 /// Expand `let`-bound `IdentifierRef` nodes, returning a Program with empty
 /// `bindings`. Matches the binding-expansion behaviour of
 /// `contingency_dsl.analyzer`. Unreferenced bindings are dropped; unresolved
@@ -2933,7 +3379,11 @@ pub fn expand_bindings(program: Program) -> Program {
         .map(|b| (b.name.clone(), b.value.clone()))
         .collect();
     let schedule = match program.schedule {
-        ProgramSchedule::Operant(expr) => ProgramSchedule::Operant(expand_schedule(expr, &env)),
+        ProgramSchedule::Operant(expr) => {
+            let mut visiting: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            ProgramSchedule::Operant(expand_schedule(expr, &env, &mut visiting))
+        }
         other => other,
     };
     Program {
@@ -2947,28 +3397,39 @@ pub fn expand_bindings(program: Program) -> Program {
 fn expand_schedule(
     expr: ScheduleExpr,
     env: &BTreeMap<String, ScheduleExpr>,
+    visiting: &mut std::collections::BTreeSet<String>,
 ) -> ScheduleExpr {
     match expr {
-        ScheduleExpr::IdentifierRef(r) => match env.get(&r.name) {
-            Some(replacement) => expand_schedule(replacement.clone(), env),
-            None => ScheduleExpr::IdentifierRef(r),
-        },
+        ScheduleExpr::IdentifierRef(r) => {
+            if visiting.contains(&r.name) {
+                return ScheduleExpr::IdentifierRef(r);
+            }
+            match env.get(&r.name) {
+                Some(replacement) => {
+                    visiting.insert(r.name.clone());
+                    let out = expand_schedule(replacement.clone(), env, visiting);
+                    visiting.remove(&r.name);
+                    out
+                }
+                None => ScheduleExpr::IdentifierRef(r),
+            }
+        }
         ScheduleExpr::Compound(mut c) => {
             c.components = c
                 .components
                 .into_iter()
-                .map(|comp| expand_schedule(comp, env))
+                .map(|comp| expand_schedule(comp, env, visiting))
                 .collect();
             ScheduleExpr::Compound(c)
         }
         ScheduleExpr::Modifier(mut m) => {
             if let Some(inner) = m.inner.take() {
-                m.inner = Some(Box::new(expand_schedule(*inner, env)));
+                m.inner = Some(Box::new(expand_schedule(*inner, env, visiting)));
             }
             ScheduleExpr::Modifier(m)
         }
         ScheduleExpr::LimitedHold(mut lh) => {
-            lh.inner = Box::new(expand_schedule(*lh.inner, env));
+            lh.inner = Box::new(expand_schedule(*lh.inner, env, visiting));
             ScheduleExpr::LimitedHold(lh)
         }
         ScheduleExpr::SecondOrder(so) => {
@@ -2977,17 +3438,17 @@ fn expand_schedule(
             ScheduleExpr::SecondOrder(SecondOrder { overall, unit })
         }
         ScheduleExpr::TimeoutWrapped(mut tw) => {
-            tw.inner = Box::new(expand_schedule(*tw.inner, env));
+            tw.inner = Box::new(expand_schedule(*tw.inner, env, visiting));
             ScheduleExpr::TimeoutWrapped(tw)
         }
         ScheduleExpr::ResponseCostWrapped(mut rw) => {
-            rw.inner = Box::new(expand_schedule(*rw.inner, env));
+            rw.inner = Box::new(expand_schedule(*rw.inner, env, visiting));
             ScheduleExpr::ResponseCostWrapped(rw)
         }
         ScheduleExpr::Annotated(boxed) => {
             let AnnotatedSchedule { expr, annotations } = *boxed;
             ScheduleExpr::Annotated(Box::new(AnnotatedSchedule {
-                expr: expand_schedule(expr, env),
+                expr: expand_schedule(expr, env, visiting),
                 annotations,
             }))
         }

@@ -44,6 +44,35 @@ impl DslError {
     pub fn semantic(message: impl Into<String>, span: SourceSpan) -> Self {
         Self { kind: DslErrorKind::Semantic, message: message.into(), span: Some(span) }
     }
+
+    /// Extract the conformance-style error code that prefixes the message
+    /// (e.g. "SIDMAN_MISSING_SSI" from "SIDMAN_MISSING_SSI: details").
+    /// Returns None when the message has no uppercase-code prefix.
+    pub fn code(&self) -> Option<&str> {
+        let prefix_end = self
+            .message
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))?;
+        if prefix_end == 0 {
+            return None;
+        }
+        let prefix = &self.message[..prefix_end];
+        // Accept the prefix only when followed by ':' optionally with space,
+        // or end-of-string.
+        let rest = &self.message[prefix_end..];
+        if rest.starts_with(':') || rest.is_empty() {
+            Some(prefix)
+        } else {
+            None
+        }
+    }
+
+    pub fn kind_str(&self) -> &'static str {
+        match self.kind {
+            DslErrorKind::Lex => "LexError",
+            DslErrorKind::Parse => "ParseError",
+            DslErrorKind::Semantic => "SemanticError",
+        }
+    }
 }
 
 impl fmt::Display for DslError {

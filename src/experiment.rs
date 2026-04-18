@@ -78,6 +78,9 @@ pub struct Phase {
 pub struct PhaseSequence {
     pub phases: Vec<Phase>,
     pub program_annotations: Vec<Annotation>,
+    /// Parse-time diagnostic codes attached to the sequence (e.g.
+    /// `ADVANCE_SINGLE_STEP`). Not serialized.
+    pub warnings: Vec<String>,
 }
 
 // --- Paper & Experiment ---
