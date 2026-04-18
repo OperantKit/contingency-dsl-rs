@@ -12,3 +12,4 @@ name = "contingency_dsl"
 path = "src/lib.rs"
 
 [dev-dependencies]
+serde_json = "1"
