@@ -568,7 +568,19 @@ impl Parser {
 
     fn parse_phase_block(&mut self) -> Result<crate::experiment::Phase> {
         self.expect(TokenType::Phase, "phase")?;
-        let label_tok = self.expect(TokenType::Identifier, "phase label")?;
+        let lt = self.peek().clone();
+        let label_tok = match lt.ty {
+            TokenType::Identifier | TokenType::Number => {
+                self.advance();
+                lt
+            }
+            _ => {
+                return Err(DslError::parse(
+                    format!("expected phase label, got {:?} '{}'", lt.ty, lt.value),
+                    SourceSpan::new(lt.line, lt.col),
+                ))
+            }
+        };
         self.expect(TokenType::Colon, ": after phase label")?;
         self.skip_newlines();
 
