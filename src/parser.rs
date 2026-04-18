@@ -130,22 +130,104 @@ impl Parser {
             program_annotations.push(self.parse_annotation()?);
             self.skip_newlines();
         }
-        if self.at(TokenType::Phase) {
+        if self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
             let seq = self.parse_phase_sequence(program_annotations)?;
             return Ok(TopLevel::PhaseSequence(seq));
         }
-        if self.at_any(&[
-            TokenType::Experiment,
-            TokenType::Shaping,
-            TokenType::Progressive,
-        ]) {
+        if self.at(TokenType::Experiment) {
+            let paper = self.parse_paper(program_annotations)?;
+            return Ok(TopLevel::Paper(paper));
+        }
+        if self.at(TokenType::Progressive) {
             return Err(DslError::parse(
-                "experiment / shaping / progressive blocks not yet supported by rs parser",
+                "progressive blocks not yet supported by rs parser",
                 SourceSpan::new(self.peek().line, self.peek().col),
             ));
         }
         let p = self.parse_program_body(program_annotations)?;
         Ok(TopLevel::Program(p))
+    }
+
+    fn parse_paper(
+        &mut self,
+        shared_annotations: Vec<Annotation>,
+    ) -> Result<crate::experiment::Paper> {
+        let mut experiments: Vec<crate::experiment::Experiment> = Vec::new();
+        while self.at(TokenType::Experiment) {
+            experiments.push(self.parse_experiment_block()?);
+            self.skip_newlines();
+        }
+        if !self.at(TokenType::Eof) {
+            let t = self.peek();
+            return Err(DslError::parse(
+                format!(
+                    "unexpected token after paper: {:?} '{}'",
+                    t.ty, t.value
+                ),
+                SourceSpan::new(t.line, t.col),
+            ));
+        }
+        Ok(crate::experiment::Paper {
+            experiments,
+            shared_annotations,
+            program_annotations: Vec::new(),
+            extra: None,
+        })
+    }
+
+    fn parse_experiment_block(&mut self) -> Result<crate::experiment::Experiment> {
+        self.expect(TokenType::Experiment, "experiment")?;
+        // Label: either Identifier or Number (e.g. `experiment 1:`).
+        let label_tok = self.peek().clone();
+        let label = match label_tok.ty {
+            TokenType::Identifier | TokenType::Number => {
+                self.advance();
+                label_tok.value
+            }
+            _ => {
+                return Err(DslError::parse(
+                    format!(
+                        "expected experiment label, got {:?} '{}'",
+                        label_tok.ty, label_tok.value
+                    ),
+                    SourceSpan::new(label_tok.line, label_tok.col),
+                ))
+            }
+        };
+        self.expect(TokenType::Colon, ": after experiment label")?;
+        self.skip_newlines();
+
+        // Body: a single schedule or a phase-block sequence. Reuse the
+        // existing machinery by detecting a leading Phase/Shaping token.
+        let _body_annotations: Vec<Annotation> = Vec::new();
+        let mut phases: Vec<crate::experiment::Phase> = Vec::new();
+        if self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
+            while self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
+                if self.at(TokenType::Phase) {
+                    phases.push(self.parse_phase_block()?);
+                } else {
+                    phases.extend(self.parse_shaping_block()?);
+                }
+                self.skip_newlines();
+            }
+        } else {
+            // Single-schedule experiment body.
+            let sched = self.parse_schedule()?;
+            self.skip_newlines();
+            phases.push(crate::experiment::Phase {
+                label: label.clone(),
+                schedule: crate::experiment::PhaseSchedule::Operant(sched),
+                criterion: crate::experiment::Criterion::ExperimenterJudgment(
+                    crate::experiment::ExperimenterJudgment,
+                ),
+                annotations: Vec::new(),
+            });
+        }
+        Ok(crate::experiment::Experiment {
+            label,
+            phases,
+            annotations: Vec::new(),
+        })
     }
 
     fn parse_program_body(
@@ -202,8 +284,12 @@ impl Parser {
         program_annotations: Vec<Annotation>,
     ) -> Result<crate::experiment::PhaseSequence> {
         let mut phases: Vec<crate::experiment::Phase> = Vec::new();
-        while self.at(TokenType::Phase) {
-            phases.push(self.parse_phase_block()?);
+        while self.at_any(&[TokenType::Phase, TokenType::Shaping]) {
+            if self.at(TokenType::Phase) {
+                phases.push(self.parse_phase_block()?);
+            } else {
+                phases.extend(self.parse_shaping_block()?);
+            }
             self.skip_newlines();
         }
         if !self.at(TokenType::Eof) {
@@ -220,6 +306,137 @@ impl Parser {
             phases,
             program_annotations,
         })
+    }
+
+    fn parse_shaping_block(&mut self) -> Result<Vec<crate::experiment::Phase>> {
+        self.expect(TokenType::Shaping, "shaping")?;
+        let label_tok = self.expect(TokenType::Identifier, "shaping label")?;
+        self.expect(TokenType::Colon, ": after shaping label")?;
+        self.skip_newlines();
+        // Collect shaping-metadata kwargs into a param-map for the
+        // @procedure annotation that gets emitted on the desugared phase.
+        let mut target: Option<String> = None;
+        let mut method: String = "artful".into();
+        let mut approximations: Option<Vec<JsonValue>> = None;
+        let mut dimension: Option<String> = None;
+        let mut percentile_rank: Option<i64> = None;
+        let mut percentile_window: Option<i64> = None;
+        let mut percentile_dir: Option<String> = None;
+        loop {
+            self.skip_newlines();
+            if !self.at(TokenType::Identifier) {
+                break;
+            }
+            let key = self.peek().value.clone();
+            if !matches!(
+                key.as_str(),
+                "target"
+                    | "method"
+                    | "approximations"
+                    | "dimension"
+                    | "percentile_rank"
+                    | "percentile_window"
+                    | "percentile_dir"
+            ) {
+                break;
+            }
+            self.advance();
+            self.expect(TokenType::Equals, "= after shaping kwarg")?;
+            let v = self.parse_annotation_value()?;
+            match key.as_str() {
+                "target" => {
+                    target = Some(match v {
+                        AnnotationValue::Str(s) => s,
+                        other => annotation_value_to_string(&other),
+                    });
+                }
+                "method" => {
+                    method = match v {
+                        AnnotationValue::Str(s) => s,
+                        other => annotation_value_to_string(&other),
+                    };
+                }
+                "approximations" => {
+                    if let AnnotationValue::Json(JsonValue::Array(xs)) = v {
+                        approximations = Some(xs);
+                    }
+                }
+                "dimension" => {
+                    dimension = Some(match v {
+                        AnnotationValue::Str(s) => s,
+                        other => annotation_value_to_string(&other),
+                    });
+                }
+                "percentile_rank" => {
+                    if let AnnotationValue::Int(i) = v {
+                        percentile_rank = Some(i);
+                    }
+                }
+                "percentile_window" => {
+                    if let AnnotationValue::Int(i) = v {
+                        percentile_window = Some(i);
+                    }
+                }
+                "percentile_dir" => {
+                    percentile_dir = Some(match v {
+                        AnnotationValue::Str(s) => s,
+                        other => annotation_value_to_string(&other),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let target = target.ok_or_else(|| {
+            DslError::parse(
+                format!("MISSING_SHAPING_TARGET: shaping '{}' has no 'target'", label_tok.value),
+                SourceSpan::new(label_tok.line, label_tok.col),
+            )
+        })?;
+        let mut params: BTreeMap<String, AnnotationValue> = BTreeMap::new();
+        params.insert("target".into(), AnnotationValue::Str(target.clone()));
+        params.insert("method".into(), AnnotationValue::Str(method.clone()));
+        if let Some(xs) = approximations {
+            params.insert(
+                "approximations".into(),
+                AnnotationValue::Json(JsonValue::Array(xs)),
+            );
+        }
+        if let Some(d) = &dimension {
+            params.insert("dimension".into(), AnnotationValue::Str(d.clone()));
+        }
+        let proc_ann = Annotation {
+            keyword: "procedure".into(),
+            positional: Some(AnnotationValue::Str("shape".into())),
+            params: Some(params),
+            label: None,
+        };
+        let schedule = match method.as_str() {
+            "artful" => ScheduleExpr::Special(Special { kind: SpecialKind::Crf }),
+            "percentile" => ScheduleExpr::Modifier(Modifier {
+                kind: ModifierKind::Pctl,
+                value: None,
+                time_unit: None,
+                inner: None,
+                pr_step: None,
+                pr_start: None,
+                pr_increment: None,
+                pr_ratio: None,
+                pctl_target: dimension,
+                pctl_rank: percentile_rank,
+                pctl_window: percentile_window,
+                pctl_dir: percentile_dir.or(Some("below".into())),
+                length: None,
+            }),
+            _ => ScheduleExpr::Special(Special { kind: SpecialKind::Crf }),
+        };
+        Ok(vec![crate::experiment::Phase {
+            label: label_tok.value,
+            schedule: crate::experiment::PhaseSchedule::Operant(schedule),
+            criterion: crate::experiment::Criterion::ExperimenterJudgment(
+                crate::experiment::ExperimenterJudgment,
+            ),
+            annotations: vec![proc_ann],
+        }])
     }
 
     fn parse_phase_block(&mut self) -> Result<crate::experiment::Phase> {
@@ -2309,6 +2526,18 @@ fn annotation_value_to_json(v: &AnnotationValue) -> JsonValue {
         AnnotationValue::Int(i) => JsonValue::Int(*i),
         AnnotationValue::Float(f) => JsonValue::Float(*f),
         AnnotationValue::Json(j) => j.clone(),
+    }
+}
+
+fn annotation_value_to_string(v: &AnnotationValue) -> String {
+    match v {
+        AnnotationValue::Str(s) => s.clone(),
+        AnnotationValue::Int(i) => i.to_string(),
+        AnnotationValue::Float(f) => f.to_string(),
+        AnnotationValue::Json(JsonValue::String(s)) => s.clone(),
+        AnnotationValue::Json(JsonValue::Int(i)) => i.to_string(),
+        AnnotationValue::Json(JsonValue::Float(f)) => f.to_string(),
+        _ => String::new(),
     }
 }
 

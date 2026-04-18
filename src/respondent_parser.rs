@@ -180,15 +180,35 @@ fn parse_pair(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     p.expect(TokenType::Dot, ". after Pair")?;
     let variant_tok = p.expect(TokenType::Identifier, "Pair variant")?;
     p.expect(TokenType::LParen, "( after Pair variant")?;
-    let cs = parse_cs_arg(p)?;
+    // Pair.Backward source text takes (us, cs, ...) positional order (Spetch
+    // et al., 1981). All other Pair variants take (cs, us, ...).
+    let swap = variant_tok.value == "Backward";
+    let first = parse_cs_arg(p)?;
     p.expect(TokenType::Comma, ",")?;
-    // us: either positional identifier/string, or us=<ref>.
-    let us = if p.at(TokenType::Identifier) && p.peek().value == "us" {
+    let second = if p.at(TokenType::Identifier)
+        && (p.peek().value == "us" || p.peek().value == "cs")
+        && p.peek_at(1).map_or(false, |n| n.ty == TokenType::Equals)
+    {
         p.advance();
         p.expect(TokenType::Equals, "=")?;
         parse_stimulus_ref(p)?
     } else {
         parse_stimulus_ref(p)?
+    };
+    let (cs, us) = if swap {
+        // `first` was us (as CsArg); extract its ref form.
+        let us_name = match first.kind {
+            CsArgKind::Ref(s) => s,
+            _ => {
+                return Err(DslError::parse(
+                    "Pair.Backward US must be a single identifier",
+                    SourceSpan::new(variant_tok.line, variant_tok.col),
+                ))
+            }
+        };
+        (CsArg { kind: CsArgKind::Ref(second) }, us_name)
+    } else {
+        (first, second)
     };
     let mut isi: Option<Duration> = None;
     let mut cs_duration: Option<Duration> = None;
@@ -338,6 +358,14 @@ fn parse_cs_only(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     let mut trials: Option<i64> = None;
     while p.at(TokenType::Comma) {
         p.advance();
+        // Positional trials integer after cs.
+        if p.at(TokenType::Number) && trials.is_none() {
+            let nt = p.advance();
+            if !nt.value.contains('.') {
+                trials = Some(nt.value.parse().unwrap_or(0));
+                continue;
+            }
+        }
         let key = p.expect(TokenType::Identifier, "CSOnly kwarg name")?;
         p.expect(TokenType::Equals, "=")?;
         match key.value.as_str() {
@@ -379,6 +407,13 @@ fn parse_us_only(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     let mut trials: Option<i64> = None;
     while p.at(TokenType::Comma) {
         p.advance();
+        if p.at(TokenType::Number) && trials.is_none() {
+            let nt = p.advance();
+            if !nt.value.contains('.') {
+                trials = Some(nt.value.parse().unwrap_or(0));
+                continue;
+            }
+        }
         let key = p.expect(TokenType::Identifier, "USOnly kwarg name")?;
         p.expect(TokenType::Equals, "=")?;
         match key.value.as_str() {

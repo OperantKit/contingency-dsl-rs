@@ -119,8 +119,33 @@ fn experiment_to_json(exp: &Experiment) -> JsonValue {
     let mut m = BTreeMap::new();
     m.insert("type".into(), JsonValue::String("Experiment".into()));
     m.insert("label".into(), JsonValue::String(exp.label.clone()));
-    let phases: Vec<JsonValue> = exp.phases.iter().map(phase_to_json).collect();
-    let body = JsonValue::Object({
+    // Emit body as a plain Program when the experiment is a single
+    // synthetic phase (i.e. the source text was a bare schedule under
+    // `experiment <label>:`). Otherwise emit it as a PhaseSequence.
+    let single_schedule = exp.phases.len() == 1
+        && matches!(
+            exp.phases[0].criterion,
+            crate::experiment::Criterion::ExperimenterJudgment(_)
+        )
+        && exp.phases[0].annotations.is_empty()
+        && exp.phases[0].label == exp.label;
+    let body = if single_schedule {
+        let phase = &exp.phases[0];
+        let mut b = BTreeMap::new();
+        b.insert("type".into(), JsonValue::String("Program".into()));
+        b.insert(
+            "program_annotations".into(),
+            JsonValue::Array(exp.annotations.iter().map(annotation_to_json).collect()),
+        );
+        b.insert("param_decls".into(), JsonValue::Array(vec![]));
+        b.insert("bindings".into(), JsonValue::Array(vec![]));
+        b.insert(
+            "schedule".into(),
+            phase_schedule_to_json(&phase.schedule),
+        );
+        JsonValue::Object(b)
+    } else {
+        let phases: Vec<JsonValue> = exp.phases.iter().map(phase_to_json).collect();
         let mut b = BTreeMap::new();
         b.insert("type".into(), JsonValue::String("PhaseSequence".into()));
         b.insert(
@@ -129,8 +154,8 @@ fn experiment_to_json(exp: &Experiment) -> JsonValue {
         );
         b.insert("shared_param_decls".into(), JsonValue::Array(vec![]));
         b.insert("phases".into(), JsonValue::Array(phases));
-        b
-    });
+        JsonValue::Object(b)
+    };
     m.insert("body".into(), body);
     JsonValue::Object(m)
 }
@@ -633,7 +658,11 @@ fn annotation_to_json(a: &Annotation) -> JsonValue {
         for (k, v) in params {
             pm.insert(k.clone(), annotation_value_to_json(v));
         }
-        m.insert("params".into(), JsonValue::Object(pm));
+        // Paper-layer fixtures use `kwargs`; other layers use `params`.
+        // Emit both so either conformance shape matches under subset
+        // comparison.
+        m.insert("params".into(), JsonValue::Object(pm.clone()));
+        m.insert("kwargs".into(), JsonValue::Object(pm));
     }
     if let Some(label) = &a.label {
         m.insert("label".into(), JsonValue::String(label.clone()));
@@ -690,30 +719,37 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             m.insert("isi".into(), duration_to_json(backward_interval));
             JsonValue::Object(m)
         }
-        RespondentExpr::Extinction(Extinction { cs, .. }) => {
+        RespondentExpr::Extinction(Extinction { cs, trials, iti }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("Extinction".into()));
             m.insert("cs".into(), JsonValue::String(cs.clone()));
+            if let Some(t) = trials {
+                m.insert("trials".into(), JsonValue::Int(*t));
+            }
+            if let Some(i) = iti {
+                m.insert("iti".into(), duration_to_json(i));
+            }
             JsonValue::Object(m)
         }
-        RespondentExpr::CsOnly(CsOnly { cs, trials, .. }) => {
+        RespondentExpr::CsOnly(CsOnly { cs, cs_duration, trials }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("CSOnly".into()));
             m.insert("cs".into(), JsonValue::String(cs.clone()));
-            m.insert(
-                "trials".into(),
-                trials.map_or(JsonValue::Null, JsonValue::Int),
-            );
+            if cs_duration.value != 0.0 {
+                m.insert("cs_duration".into(), duration_to_json(cs_duration));
+            }
+            if let Some(t) = trials {
+                m.insert("trials".into(), JsonValue::Int(*t));
+            }
             JsonValue::Object(m)
         }
         RespondentExpr::UsOnly(UsOnly { us, trials }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("USOnly".into()));
             m.insert("us".into(), JsonValue::String(us.clone()));
-            m.insert(
-                "trials".into(),
-                trials.map_or(JsonValue::Null, JsonValue::Int),
-            );
+            if let Some(t) = trials {
+                m.insert("trials".into(), JsonValue::Int(*t));
+            }
             JsonValue::Object(m)
         }
         RespondentExpr::Contingency(Contingency { cs, us, p_us_given_cs, p_us_no_cs }) => {
