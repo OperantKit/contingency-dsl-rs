@@ -716,9 +716,15 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             );
             JsonValue::Object(m)
         }
-        RespondentExpr::Contingency(Contingency { p_us_given_cs, p_us_no_cs, .. }) => {
+        RespondentExpr::Contingency(Contingency { cs, us, p_us_given_cs, p_us_no_cs }) => {
             let mut m = BTreeMap::new();
             m.insert("type".into(), JsonValue::String("Contingency".into()));
+            if !cs.is_empty() {
+                m.insert("cs".into(), JsonValue::String(cs.clone()));
+            }
+            if !us.is_empty() {
+                m.insert("us".into(), JsonValue::String(us.clone()));
+            }
             m.insert("p_us_given_cs".into(), JsonValue::Float(*p_us_given_cs));
             m.insert("p_us_given_no_cs".into(), JsonValue::Float(*p_us_no_cs));
             JsonValue::Object(m)

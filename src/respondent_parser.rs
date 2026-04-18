@@ -408,30 +408,42 @@ fn parse_us_only(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
 fn parse_contingency(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     p.advance();
     p.expect(TokenType::LParen, "( after Contingency")?;
-    let cs = parse_single_stim_arg(p, "cs")?;
-    p.expect(TokenType::Comma, ",")?;
-    let us = parse_single_stim_arg(p, "us")?;
+    // Two forms: Contingency(p_cs, p_no_cs) with bare numbers, or
+    // Contingency(cs, us, p_us_given_cs=..., p_us_given_no_cs=...).
+    let mut cs = String::new();
+    let mut us = String::new();
     let mut p_us_given_cs: Option<f64> = None;
     let mut p_us_no_cs: Option<f64> = None;
-    while p.at(TokenType::Comma) {
-        p.advance();
-        let key = p.expect(TokenType::Identifier, "Contingency kwarg")?;
-        p.expect(TokenType::Equals, "=")?;
-        let nt = p.expect(TokenType::Number, "probability")?;
-        let v: f64 = nt.value.parse().map_err(|_| {
-            DslError::parse(
-                format!("invalid probability: {}", nt.value),
-                SourceSpan::new(nt.line, nt.col),
-            )
-        })?;
-        match key.value.as_str() {
-            "p_us_given_cs" => p_us_given_cs = Some(v),
-            "p_us_given_no_cs" | "p_us_no_cs" => p_us_no_cs = Some(v),
-            _ => {
-                return Err(DslError::parse(
-                    format!("unknown Contingency kwarg '{}'", key.value),
-                    SourceSpan::new(key.line, key.col),
-                ))
+    if p.at(TokenType::Number) {
+        let nt = p.advance();
+        p_us_given_cs = Some(nt.value.parse().unwrap_or(0.0));
+        p.expect(TokenType::Comma, ",")?;
+        let nt2 = p.expect(TokenType::Number, "p_us_no_cs")?;
+        p_us_no_cs = Some(nt2.value.parse().unwrap_or(0.0));
+    } else {
+        cs = parse_single_stim_arg(p, "cs")?;
+        p.expect(TokenType::Comma, ",")?;
+        us = parse_single_stim_arg(p, "us")?;
+        while p.at(TokenType::Comma) {
+            p.advance();
+            let key = p.expect(TokenType::Identifier, "Contingency kwarg")?;
+            p.expect(TokenType::Equals, "=")?;
+            let nt = p.expect(TokenType::Number, "probability")?;
+            let v: f64 = nt.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid probability: {}", nt.value),
+                    SourceSpan::new(nt.line, nt.col),
+                )
+            })?;
+            match key.value.as_str() {
+                "p_us_given_cs" => p_us_given_cs = Some(v),
+                "p_us_given_no_cs" | "p_us_no_cs" => p_us_no_cs = Some(v),
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown Contingency kwarg '{}'", key.value),
+                        SourceSpan::new(key.line, key.col),
+                    ))
+                }
             }
         }
     }
