@@ -3,8 +3,10 @@
 //! See `../contingency-dsl/` for the language specification. The Python
 //! reference implementation lives in `../contingency-dsl-py`.
 
+pub mod ast;
 pub mod enums;
 pub mod errors;
+pub mod experiment;
 pub mod lexer;
 pub mod tokens;
 

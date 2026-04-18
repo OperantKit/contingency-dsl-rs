@@ -56,6 +56,38 @@ pub const COMBINATOR_KEYWORDS: &[&str] = &[
     "Overlay", "Interpolate", "Interp",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Combinator {
+    Conc,
+    Alt,
+    Conj,
+    Chain,
+    Tand,
+    Mult,
+    Mix,
+    Overlay,
+    Interpolate,
+    Interp,
+}
+
+impl Combinator {
+    pub fn from_keyword(word: &str) -> Option<Self> {
+        Some(match word {
+            "Conc" => Self::Conc,
+            "Alt" => Self::Alt,
+            "Conj" => Self::Conj,
+            "Chain" => Self::Chain,
+            "Tand" => Self::Tand,
+            "Mult" => Self::Mult,
+            "Mix" => Self::Mix,
+            "Overlay" => Self::Overlay,
+            "Interpolate" => Self::Interpolate,
+            "Interp" => Self::Interp,
+            _ => return None,
+        })
+    }
+}
+
 pub const DR_KEYWORDS: &[&str] = &["DRL", "DRH", "DRO"];
 
 /// Kw-arg keywords and their canonical forms.
