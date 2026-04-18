@@ -9,6 +9,7 @@ pub mod errors;
 pub mod experiment;
 pub mod lexer;
 pub mod parser;
+pub mod respondent_parser;
 pub mod serializer;
 pub mod tokens;
 

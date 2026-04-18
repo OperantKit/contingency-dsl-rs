@@ -43,7 +43,7 @@ pub fn parse(source: &str) -> Result<Program> {
     p.parse_program()
 }
 
-struct Parser {
+pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
 }
@@ -53,21 +53,21 @@ impl Parser {
         Self { tokens, pos: 0 }
     }
 
-    fn peek(&self) -> &Token {
+    pub(crate) fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
 
-    fn peek_at(&self, offset: usize) -> Option<&Token> {
+    pub(crate) fn peek_at(&self, offset: usize) -> Option<&Token> {
         self.tokens.get(self.pos + offset)
     }
 
-    fn advance(&mut self) -> Token {
+    pub(crate) fn advance(&mut self) -> Token {
         let t = self.tokens[self.pos].clone();
         self.pos += 1;
         t
     }
 
-    fn at(&self, ty: TokenType) -> bool {
+    pub(crate) fn at(&self, ty: TokenType) -> bool {
         self.peek().ty == ty
     }
 
@@ -76,7 +76,7 @@ impl Parser {
         types.iter().any(|t| *t == cur)
     }
 
-    fn expect(&mut self, ty: TokenType, ctx: &str) -> Result<Token> {
+    pub(crate) fn expect(&mut self, ty: TokenType, ctx: &str) -> Result<Token> {
         if self.peek().ty != ty {
             let t = self.peek();
             return Err(DslError::parse(
@@ -458,6 +458,15 @@ impl Parser {
                 if next_is_lparen && (peek_val == "MTS" || peek_val == "GoNoGo") {
                     return self.parse_trial_based();
                 }
+                // Respondent Tier A primitives dispatch through
+                // respondent_parser::try_parse_respondent.
+                if crate::respondent_parser::is_respondent_primitive(&peek_val) {
+                    if let Some(expr) =
+                        crate::respondent_parser::try_parse_respondent(self)?
+                    {
+                        return Ok(expr);
+                    }
+                }
                 let tok = self.advance();
                 let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
                 if self.at(TokenType::LParen) {
@@ -562,7 +571,7 @@ impl Parser {
         Ok(ScheduleExpr::Atomic(atomic))
     }
 
-    fn parse_value(&mut self) -> Result<(f64, Option<String>)> {
+    pub(crate) fn parse_value(&mut self) -> Result<(f64, Option<String>)> {
         let num = self.expect(TokenType::Number, "numeric value")?;
         let val: f64 = num.value.parse().map_err(|_| {
             DslError::parse(
