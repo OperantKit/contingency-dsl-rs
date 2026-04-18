@@ -189,21 +189,6 @@ fn conformance_coverage_report() {
                 if matched {
                     stats.error_match += 1;
                     row.2 += 1;
-                } else if let Some(JsonV::String(id)) = obj.get("id") {
-                    let code = ecode.as_deref().unwrap_or("?");
-                    let got = match &parse_result {
-                        Ok(_) => "Ok(parsed)".to_string(),
-                        Err(e) => format!(
-                            "{}:{:?}:{}",
-                            e.kind_str(),
-                            e.code(),
-                            e.to_string()
-                        ),
-                    };
-                    eprintln!(
-                        "  ERR MISS: {} :: {} :: want {}/{} got {}",
-                        rel, id, etype, code, got
-                    );
                 }
                 continue;
             }

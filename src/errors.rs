@@ -49,17 +49,22 @@ impl DslError {
     /// (e.g. "SIDMAN_MISSING_SSI" from "SIDMAN_MISSING_SSI: details").
     /// Returns None when the message has no uppercase-code prefix.
     pub fn code(&self) -> Option<&str> {
+        let is_code_char = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_';
+        if !self.message.chars().next().map_or(false, is_code_char) {
+            return None;
+        }
         let prefix_end = self
             .message
-            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))?;
+            .find(|c: char| !is_code_char(c))
+            .unwrap_or(self.message.len());
         if prefix_end == 0 {
             return None;
         }
         let prefix = &self.message[..prefix_end];
-        // Accept the prefix only when followed by ':' optionally with space,
-        // or end-of-string.
         let rest = &self.message[prefix_end..];
-        if rest.starts_with(':') || rest.is_empty() {
+        // The prefix is a code if followed by ':' (message detail), end of
+        // string, or any non-code character.
+        if rest.starts_with(':') || rest.is_empty() || !rest.chars().next().map_or(false, is_code_char) {
             Some(prefix)
         } else {
             None
