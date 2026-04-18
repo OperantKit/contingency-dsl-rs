@@ -24,12 +24,12 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    AdjustingSchedule, Atomic, AversiveKind, AversiveParam, AversiveSchedule, Binding,
-    CombinatorParamValue, Compound, CompoundParam, DirRef, DirectionalCOD, DirectionalEntry,
-    IdentifierRef, InterlockingSchedule, JsonValue, LimitedHold, Modifier, ModifierKind,
-    NumericPayload, ParamDecl, Program, ProgramSchedule, PunishParam, ResponseCost,
-    ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder, Special, SpecialKind, Timeout,
-    TimeoutWrapped, TrialBased, TrialParam,
+    AdjustingSchedule, AnnotatedSchedule, Annotation, AnnotationValue, Atomic, AversiveKind,
+    AversiveParam, AversiveSchedule, Binding, CombinatorParamValue, Compound, CompoundParam,
+    DirRef, DirectionalCOD, DirectionalEntry, IdentifierRef, InterlockingSchedule, JsonValue,
+    LimitedHold, Modifier, ModifierKind, NumericPayload, ParamDecl, Program, ProgramSchedule,
+    PunishParam, ResponseCost, ResponseCostWrapped, ScheduleExpr, ScheduleType, SecondOrder,
+    Special, SpecialKind, Timeout, TimeoutWrapped, TrialBased, TrialParam,
 };
 use crate::enums::{Combinator, Distribution, Domain, KW_ARG_KEYWORDS, LOWERCASE_RESERVED};
 use crate::errors::{DslError, Result, SourceSpan};
@@ -99,11 +99,10 @@ impl Parser {
     fn parse_program(&mut self) -> Result<Program> {
         self.skip_newlines();
 
-        if self.at(TokenType::At) {
-            return Err(DslError::parse(
-                "annotations not yet supported by rs parser",
-                SourceSpan::new(self.peek().line, self.peek().col),
-            ));
+        let mut program_annotations: Vec<Annotation> = Vec::new();
+        while self.at(TokenType::At) {
+            program_annotations.push(self.parse_annotation()?);
+            self.skip_newlines();
         }
 
         if self.at_any(&[
@@ -155,11 +154,249 @@ impl Parser {
         }
 
         Ok(Program {
-            program_annotations: Vec::new(),
+            program_annotations,
             param_decls,
             bindings,
             schedule: ProgramSchedule::Operant(schedule),
         })
+    }
+
+    pub(crate) fn parse_annotation(&mut self) -> Result<Annotation> {
+        self.expect(TokenType::At, "@")?;
+        let key_tok = self.peek().clone();
+        let keyword = match key_tok.ty {
+            TokenType::Identifier
+            | TokenType::Lh
+            | TokenType::Rd
+            | TokenType::KwArgName
+            | TokenType::DrMod
+            | TokenType::Pr
+            | TokenType::Repeat
+            | TokenType::DistributionName
+            | TokenType::Use
+            | TokenType::Sessions
+            | TokenType::Stable
+            | TokenType::Phase
+            | TokenType::Shaping
+            | TokenType::Progressive
+            | TokenType::Steps
+            | TokenType::Interleave
+            | TokenType::NoTrailing
+            | TokenType::Advance
+            | TokenType::When
+            | TokenType::Experiment
+            | TokenType::NoSchedule => {
+                self.advance();
+                key_tok.value.clone()
+            }
+            _ => {
+                return Err(DslError::parse(
+                    format!(
+                        "expected annotation keyword, got {:?} '{}'",
+                        key_tok.ty, key_tok.value
+                    ),
+                    SourceSpan::new(key_tok.line, key_tok.col),
+                ))
+            }
+        };
+        let (keyword_canon, label) = match canonical_annotation_keyword(&keyword) {
+            Some(canon) if canon != keyword => (canon.to_string(), Some(keyword.clone())),
+            _ => (keyword, None),
+        };
+        let mut positional: Option<AnnotationValue> = None;
+        let mut params: Option<BTreeMap<String, AnnotationValue>> = None;
+        if self.at(TokenType::LParen) {
+            self.advance();
+            if !self.at(TokenType::RParen) {
+                // First arg: either <positional> or <kw>=<value>.
+                let kv = self.parse_annotation_arg()?;
+                match kv {
+                    (Some(k), v) => {
+                        let mut pm: BTreeMap<String, AnnotationValue> = BTreeMap::new();
+                        pm.insert(k, v);
+                        params = Some(pm);
+                    }
+                    (None, v) => {
+                        positional = Some(v);
+                    }
+                }
+                while self.at(TokenType::Comma) {
+                    self.advance();
+                    let kv = self.parse_annotation_arg()?;
+                    match kv {
+                        (Some(k), v) => {
+                            let pm = params.get_or_insert_with(BTreeMap::new);
+                            pm.insert(k, v);
+                        }
+                        (None, _) => {
+                            let t = self.peek();
+                            return Err(DslError::parse(
+                                "positional arg after keyword arg in annotation",
+                                SourceSpan::new(t.line, t.col),
+                            ));
+                        }
+                    }
+                }
+            }
+            self.expect(TokenType::RParen, "annotation closing paren")?;
+        }
+        Ok(Annotation {
+            keyword: keyword_canon,
+            positional,
+            params,
+            label,
+        })
+    }
+
+    fn parse_annotation_arg(&mut self) -> Result<(Option<String>, AnnotationValue)> {
+        // Lookahead for `<ident>=`.
+        let is_kw = matches!(
+            self.peek().ty,
+            TokenType::Identifier
+                | TokenType::Lh
+                | TokenType::Rd
+                | TokenType::KwArgName
+                | TokenType::Use
+                | TokenType::DistributionName
+        ) && self
+            .peek_at(1)
+            .map_or(false, |n| n.ty == TokenType::Equals);
+        if is_kw {
+            let key = self.advance();
+            self.advance(); // =
+            let v = self.parse_annotation_value()?;
+            return Ok((Some(key.value), v));
+        }
+        let v = self.parse_annotation_value()?;
+        Ok((None, v))
+    }
+
+    fn parse_annotation_value(&mut self) -> Result<AnnotationValue> {
+        let t = self.peek().clone();
+        match t.ty {
+            TokenType::StringLiteral => {
+                self.advance();
+                Ok(AnnotationValue::Str(t.value))
+            }
+            TokenType::Number => {
+                self.advance();
+                // Optional time/unit suffix.
+                if self.at(TokenType::TimeUnit) || self.at(TokenType::Percent) {
+                    let u = self.advance();
+                    let mut m = BTreeMap::new();
+                    let v: f64 = t.value.parse().unwrap_or(0.0);
+                    m.insert("value".into(), JsonValue::Float(v));
+                    m.insert(
+                        if u.ty == TokenType::Percent {
+                            "unit".into()
+                        } else {
+                            "time_unit".into()
+                        },
+                        JsonValue::String(if u.ty == TokenType::Percent {
+                            "%".into()
+                        } else {
+                            u.value
+                        }),
+                    );
+                    return Ok(AnnotationValue::Json(JsonValue::Object(m)));
+                }
+                if t.value.contains('.') {
+                    Ok(AnnotationValue::Float(t.value.parse().unwrap_or(0.0)))
+                } else {
+                    Ok(AnnotationValue::Int(t.value.parse().unwrap_or(0)))
+                }
+            }
+            TokenType::Minus => {
+                self.advance();
+                let nt = self.expect(TokenType::Number, "negative value")?;
+                if nt.value.contains('.') {
+                    Ok(AnnotationValue::Float(
+                        -nt.value.parse::<f64>().unwrap_or(0.0),
+                    ))
+                } else {
+                    Ok(AnnotationValue::Int(
+                        -nt.value.parse::<i64>().unwrap_or(0),
+                    ))
+                }
+            }
+            TokenType::LBracket => {
+                self.advance();
+                let mut items = Vec::new();
+                if !self.at(TokenType::RBracket) {
+                    items.push(annotation_value_to_json(&self.parse_annotation_value()?));
+                    while self.at(TokenType::Comma) {
+                        self.advance();
+                        items.push(annotation_value_to_json(&self.parse_annotation_value()?));
+                    }
+                }
+                self.expect(TokenType::RBracket, "] in annotation")?;
+                Ok(AnnotationValue::Json(JsonValue::Array(items)))
+            }
+            TokenType::LBrace => {
+                self.advance();
+                let mut m = BTreeMap::new();
+                if !self.at(TokenType::RBrace) {
+                    let (k, v) = self.parse_annotation_object_entry()?;
+                    m.insert(k, annotation_value_to_json(&v));
+                    while self.at(TokenType::Comma) {
+                        self.advance();
+                        let (k, v) = self.parse_annotation_object_entry()?;
+                        m.insert(k, annotation_value_to_json(&v));
+                    }
+                }
+                self.expect(TokenType::RBrace, "} in annotation")?;
+                Ok(AnnotationValue::Json(JsonValue::Object(m)))
+            }
+            TokenType::Identifier
+            | TokenType::DistributionName
+            | TokenType::Use
+            | TokenType::DrMod => {
+                self.advance();
+                match t.value.as_str() {
+                    "true" => Ok(AnnotationValue::Json(JsonValue::Bool(true))),
+                    "false" => Ok(AnnotationValue::Json(JsonValue::Bool(false))),
+                    _ => Ok(AnnotationValue::Str(t.value)),
+                }
+            }
+            _ => Err(DslError::parse(
+                format!(
+                    "unexpected token in annotation value: {:?} '{}'",
+                    t.ty, t.value
+                ),
+                SourceSpan::new(t.line, t.col),
+            )),
+        }
+    }
+
+    fn parse_annotation_object_entry(&mut self) -> Result<(String, AnnotationValue)> {
+        let t = self.peek().clone();
+        let key = match t.ty {
+            TokenType::StringLiteral | TokenType::Identifier => {
+                self.advance();
+                t.value
+            }
+            _ => {
+                return Err(DslError::parse(
+                    format!(
+                        "expected object key in annotation, got {:?} '{}'",
+                        t.ty, t.value
+                    ),
+                    SourceSpan::new(t.line, t.col),
+                ))
+            }
+        };
+        // Accept either `key: value` or `key = value`.
+        if self.at(TokenType::Colon) || self.at(TokenType::Equals) {
+            self.advance();
+        } else {
+            let nt = self.peek();
+            return Err(DslError::parse(
+                "expected ':' or '=' in annotation object entry",
+                SourceSpan::new(nt.line, nt.col),
+            ));
+        }
+        let v = self.parse_annotation_value()?;
+        Ok((key, v))
     }
 
     fn parse_param_decl(&mut self) -> Result<ParamDecl> {
@@ -254,6 +491,17 @@ impl Parser {
                 ));
             }
             base = self.parse_response_cost_postfix(base)?;
+        }
+        // Trailing schedule-level annotations.
+        if self.at(TokenType::At) {
+            let mut anns = Vec::new();
+            while self.at(TokenType::At) {
+                anns.push(self.parse_annotation()?);
+            }
+            base = ScheduleExpr::Annotated(Box::new(AnnotatedSchedule {
+                expr: base,
+                annotations: anns,
+            }));
         }
         Ok(base)
     }
@@ -1863,6 +2111,24 @@ impl Parser {
             "bare numeric literal at schedule start is not valid DSL (use Repeat(N, schedule))",
             SourceSpan::new(t.line, t.col),
         ))
+    }
+}
+
+fn canonical_annotation_keyword(kw: &str) -> Option<&'static str> {
+    match kw {
+        "punisher" | "consequentStimulus" => Some("reinforcer"),
+        "hw" => Some("hardware"),
+        "subject" => Some("subjects"),
+        _ => None,
+    }
+}
+
+fn annotation_value_to_json(v: &AnnotationValue) -> JsonValue {
+    match v {
+        AnnotationValue::Str(s) => JsonValue::String(s.clone()),
+        AnnotationValue::Int(i) => JsonValue::Int(*i),
+        AnnotationValue::Float(f) => JsonValue::Float(*f),
+        AnnotationValue::Json(j) => j.clone(),
     }
 }
 

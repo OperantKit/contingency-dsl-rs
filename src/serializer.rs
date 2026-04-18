@@ -623,6 +623,7 @@ fn annotated_schedule_to_json(a: &AnnotatedSchedule) -> JsonValue {
 
 fn annotation_to_json(a: &Annotation) -> JsonValue {
     let mut m = BTreeMap::new();
+    m.insert("type".into(), JsonValue::String("Annotation".into()));
     m.insert("keyword".into(), JsonValue::String(a.keyword.clone()));
     if let Some(pos) = &a.positional {
         m.insert("positional".into(), annotation_value_to_json(pos));
