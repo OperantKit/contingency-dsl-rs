@@ -233,6 +233,7 @@ impl Parser {
             }
             TokenType::Combinator => self.parse_compound(),
             TokenType::DrMod => self.parse_dr_mod(),
+            TokenType::Pr => self.parse_pr_mod(),
             TokenType::Repeat => self.parse_repeat_call(),
             TokenType::ScheduleType => self.parse_atomic_or_second(),
             TokenType::Ext => {
@@ -248,6 +249,15 @@ impl Parser {
                 self.parse_repeat_shorthand()
             }
             TokenType::Identifier => {
+                // Lag N / LagN / Lag(N[, length=N])
+                let peek_val = self.peek().value.clone();
+                if peek_val == "Lag"
+                    || (peek_val.starts_with("Lag")
+                        && peek_val[3..].chars().all(|c| c.is_ascii_digit())
+                        && !peek_val[3..].is_empty())
+                {
+                    return self.parse_lag();
+                }
                 let tok = self.advance();
                 let r = ScheduleExpr::IdentifierRef(IdentifierRef { name: tok.value });
                 if self.at(TokenType::LParen) {
@@ -740,6 +750,254 @@ impl Parser {
             pr_start: None,
             pr_increment: None,
             pr_ratio: None,
+            pctl_target: None,
+            pctl_rank: None,
+            pctl_window: None,
+            pctl_dir: None,
+            length: None,
+        }))
+    }
+
+    fn parse_lag(&mut self) -> Result<ScheduleExpr> {
+        let tok = self.expect(TokenType::Identifier, "Lag")?;
+        // Lag5 compact form.
+        let compact_digits: String =
+            tok.value.chars().skip(3).take_while(|c| c.is_ascii_digit()).collect();
+        if !compact_digits.is_empty() {
+            let n: f64 = compact_digits.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid Lag compact value: {}", tok.value),
+                    SourceSpan::new(tok.line, tok.col),
+                )
+            })?;
+            return Ok(ScheduleExpr::Modifier(Modifier {
+                kind: ModifierKind::Lag,
+                value: Some(n),
+                time_unit: None,
+                inner: None,
+                pr_step: None,
+                pr_start: None,
+                pr_increment: None,
+                pr_ratio: None,
+                pctl_target: None,
+                pctl_rank: None,
+                pctl_window: None,
+                pctl_dir: None,
+                length: Some(1),
+            }));
+        }
+        // Lag N whitespace-separated shorthand.
+        if self.at(TokenType::Number) {
+            let num_tok = self.advance();
+            let n: f64 = num_tok.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid Lag value: {}", num_tok.value),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                )
+            })?;
+            return Ok(ScheduleExpr::Modifier(Modifier {
+                kind: ModifierKind::Lag,
+                value: Some(n),
+                time_unit: None,
+                inner: None,
+                pr_step: None,
+                pr_start: None,
+                pr_increment: None,
+                pr_ratio: None,
+                pctl_target: None,
+                pctl_rank: None,
+                pctl_window: None,
+                pctl_dir: None,
+                length: Some(1),
+            }));
+        }
+        // Lag(n[, length=N]).
+        self.expect(TokenType::LParen, "Lag opening paren")?;
+        let num_tok = self.expect(TokenType::Number, "Lag positional n")?;
+        let n: f64 = num_tok.value.parse().map_err(|_| {
+            DslError::parse(
+                format!("invalid Lag value: {}", num_tok.value),
+                SourceSpan::new(num_tok.line, num_tok.col),
+            )
+        })?;
+        let mut length: i64 = 1;
+        if self.at(TokenType::Comma) {
+            self.advance();
+            let name_tok = self.expect(TokenType::Identifier, "Lag kwarg name")?;
+            if name_tok.value != "length" {
+                return Err(DslError::parse(
+                    format!("unknown Lag kwarg '{}'", name_tok.value),
+                    SourceSpan::new(name_tok.line, name_tok.col),
+                ));
+            }
+            self.expect(TokenType::Equals, "= after Lag length")?;
+            let lt = self.expect(TokenType::Number, "Lag length value")?;
+            if lt.value.contains('.') {
+                return Err(DslError::parse(
+                    format!("LAG_NON_INTEGER_LENGTH: {}", lt.value),
+                    SourceSpan::new(lt.line, lt.col),
+                ));
+            }
+            length = lt.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid Lag length: {}", lt.value),
+                    SourceSpan::new(lt.line, lt.col),
+                )
+            })?;
+        }
+        self.expect(TokenType::RParen, "Lag closing paren")?;
+        Ok(ScheduleExpr::Modifier(Modifier {
+            kind: ModifierKind::Lag,
+            value: Some(n),
+            time_unit: None,
+            inner: None,
+            pr_step: None,
+            pr_start: None,
+            pr_increment: None,
+            pr_ratio: None,
+            pctl_target: None,
+            pctl_rank: None,
+            pctl_window: None,
+            pctl_dir: None,
+            length: Some(length),
+        }))
+    }
+
+    fn parse_pr_mod(&mut self) -> Result<ScheduleExpr> {
+        let pr_tok = self.expect(TokenType::Pr, "PR")?;
+        // PR N shorthand.
+        if self.at(TokenType::Number) {
+            let num_tok = self.advance();
+            if num_tok.value.contains('.') {
+                return Err(DslError::parse(
+                    format!("PR_NON_INTEGER: PR shorthand requires integer (got {})", num_tok.value),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                ));
+            }
+            let n: f64 = num_tok.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid PR count: {}", num_tok.value),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                )
+            })?;
+            return Ok(ScheduleExpr::Modifier(Modifier {
+                kind: ModifierKind::Pr,
+                value: None,
+                time_unit: None,
+                inner: None,
+                pr_step: Some("linear".into()),
+                pr_start: Some(n),
+                pr_increment: Some(n),
+                pr_ratio: None,
+                pctl_target: None,
+                pctl_rank: None,
+                pctl_window: None,
+                pctl_dir: None,
+                length: None,
+            }));
+        }
+        if !self.at(TokenType::LParen) {
+            return Err(DslError::parse(
+                "PR_BARE: bare 'PR' requires a number or parenthesised options",
+                SourceSpan::new(pr_tok.line, pr_tok.col),
+            ));
+        }
+        self.advance(); // consume (
+
+        // PR(start=..., step=...) shorthand: keyword-first, elides step function.
+        let (pr_step, step_supplied) = if self.at(TokenType::PrParam)
+            || (self.at(TokenType::Identifier) && self.peek().value == "step")
+        {
+            ("linear".to_string(), false)
+        } else {
+            let step_tok = self.expect(TokenType::DistributionName, "PR step type")?;
+            if !matches!(
+                step_tok.value.as_str(),
+                "hodos" | "linear" | "exponential" | "geometric"
+            ) {
+                return Err(DslError::parse(
+                    format!("PR step type must be hodos/linear/exponential/geometric, got '{}'", step_tok.value),
+                    SourceSpan::new(step_tok.line, step_tok.col),
+                ));
+            }
+            (step_tok.value, true)
+        };
+        let mut pr_start: Option<f64> = None;
+        let mut pr_increment: Option<f64> = None;
+        let mut pr_ratio: Option<f64> = None;
+        let mut is_first_kwarg = !step_supplied;
+        while is_first_kwarg || self.at(TokenType::Comma) {
+            if !is_first_kwarg {
+                self.advance();
+            }
+            is_first_kwarg = false;
+            let ptok = self.peek().clone();
+            if !matches!(ptok.ty, TokenType::PrParam | TokenType::Identifier) {
+                return Err(DslError::parse(
+                    format!("expected PR parameter name, got {:?} '{}'", ptok.ty, ptok.value),
+                    SourceSpan::new(ptok.line, ptok.col),
+                ));
+            }
+            self.advance();
+            self.expect(TokenType::Equals, "= after PR param")?;
+            let num_tok = self.expect(TokenType::Number, "PR param value")?;
+            let param_name = if ptok.value == "step" {
+                "increment".to_string()
+            } else {
+                ptok.value.clone()
+            };
+            let v: f64 = num_tok.value.parse().map_err(|_| {
+                DslError::parse(
+                    format!("invalid PR param value: {}", num_tok.value),
+                    SourceSpan::new(num_tok.line, num_tok.col),
+                )
+            })?;
+            match param_name.as_str() {
+                "start" => {
+                    if num_tok.value.contains('.') {
+                        return Err(DslError::parse(
+                            format!("PR_NON_INTEGER_START: got {}", num_tok.value),
+                            SourceSpan::new(num_tok.line, num_tok.col),
+                        ));
+                    }
+                    pr_start = Some(v);
+                }
+                "increment" => {
+                    if num_tok.value.contains('.') {
+                        return Err(DslError::parse(
+                            format!("PR_NON_INTEGER_INCREMENT: got {}", num_tok.value),
+                            SourceSpan::new(num_tok.line, num_tok.col),
+                        ));
+                    }
+                    pr_increment = Some(v);
+                }
+                "ratio" => {
+                    if pr_step == "geometric" && v <= 1.0 {
+                        return Err(DslError::parse(
+                            format!("PR_GEOMETRIC_RATIO_NOT_PROGRESSIVE: got {}", v),
+                            SourceSpan::new(num_tok.line, num_tok.col),
+                        ));
+                    }
+                    pr_ratio = Some(v);
+                }
+                _ => {
+                    return Err(DslError::parse(
+                        format!("unknown PR kwarg '{}'", ptok.value),
+                        SourceSpan::new(ptok.line, ptok.col),
+                    ))
+                }
+            }
+        }
+        self.expect(TokenType::RParen, "PR closing paren")?;
+        Ok(ScheduleExpr::Modifier(Modifier {
+            kind: ModifierKind::Pr,
+            value: None,
+            time_unit: None,
+            inner: None,
+            pr_step: Some(pr_step),
+            pr_start,
+            pr_increment,
+            pr_ratio,
             pctl_target: None,
             pctl_rank: None,
             pctl_window: None,
