@@ -701,7 +701,9 @@ fn respondent_to_json(r: &RespondentExpr) -> JsonValue {
             m.insert("cs".into(), cs_arg_to_json(cs));
             m.insert("us".into(), JsonValue::String(us.clone()));
             m.insert("trace_interval".into(), duration_to_json(trace_interval));
-            m.insert("cs_duration".into(), duration_to_json(cs_duration));
+            if cs_duration.value != 0.0 {
+                m.insert("cs_duration".into(), duration_to_json(cs_duration));
+            }
             JsonValue::Object(m)
         }
         RespondentExpr::PairSimultaneous(PairSimultaneous { cs, us, duration: _ }) => {

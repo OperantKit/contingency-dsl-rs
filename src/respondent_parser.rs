@@ -183,6 +183,14 @@ fn parse_pair(p: &mut crate::parser::Parser) -> Result<ScheduleExpr> {
     // Pair.Backward source text takes (us, cs, ...) positional order (Spetch
     // et al., 1981). All other Pair variants take (cs, us, ...).
     let swap = variant_tok.value == "Backward";
+    // First arg: accept positional CS, `cs=...` kwarg, or `us=...` kwarg.
+    let kw_first = p.at(TokenType::Identifier)
+        && (p.peek().value == "cs" || p.peek().value == "us")
+        && p.peek_at(1).map_or(false, |n| n.ty == TokenType::Equals);
+    if kw_first {
+        p.advance();
+        p.expect(TokenType::Equals, "=")?;
+    }
     let first = parse_cs_arg(p)?;
     p.expect(TokenType::Comma, ",")?;
     let second = if p.at(TokenType::Identifier)
