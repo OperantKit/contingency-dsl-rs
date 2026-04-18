@@ -13,8 +13,9 @@ In-progress implementation tracked against the language-independent
 conformance suite at [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/).
 Full scope parity with `contingency-dsl-py` is the tagging target.
 
-Currently exercised fixture categories (subset match against each
-fixture's `pre_expansion` or `expected` payload):
+Currently passing ≥99% of every non-error / non-warning fixture
+category (subset match against each fixture's `pre_expansion` or
+`expected` payload):
 
 - **Operant core** — atomic, special (EXT/CRF), second-order, compound
   (all combinators; positional args, scalar kwargs COD/FRCO/BO,
@@ -23,36 +24,41 @@ fixture's `pre_expansion` or `expected` payload):
   LimitedHold postfix, TO and ResponseCost postfix, let bindings,
   program-level parameter declarations
 - **Aversive** — Sidman, DiscrimAv, Escape with canonical parameters
-  and aliases (partial; annotation-dependent cases pending)
+  and aliases
 - **Stateful** — Adjusting, Interlocking, Percentile
-- **Trial-based** — MTS, GoNoGo with defaults (partial for
-  annotation-dependent declaration-mode cases)
+- **Trial-based** — MTS, GoNoGo with defaults and correction-mode
 - **Respondent Tier A** — Pair.{ForwardDelay, ForwardTrace,
   Simultaneous, Backward}, Extinction, CSOnly, USOnly, Contingency
-  (both signature forms), TrulyRandom, ExplicitlyUnpaired, Compound,
-  Serial, ITI, Differential
+  (all three signature forms), TrulyRandom (with optional p),
+  ExplicitlyUnpaired, Compound (with mode), Serial, ITI, Differential
+  (both full and short form)
 - **Annotations** — `@keyword(...)` in program and schedule scope with
-  positional strings, keyword arguments, numeric values with
-  time-unit / percent suffix, list and object literals, negative
-  numbers, and keyword aliases (punisher → reinforcer, hw → hardware,
-  subject → subjects)
+  positional strings, keyword arguments, numeric values with time-unit
+  or percent suffix, list and object literals, negative numbers, and
+  keyword aliases (punisher → reinforcer, hw → hardware, subject →
+  subjects). Schedule-scoped routing for `trial_mix` and for
+  `training` / `testing` on declaration-mode MTS
 - **Experiment** — `phase <Label>:` blocks with FixedSessions,
   Stability (visual / cv / rate / iri / latency methods), and
-  ExperimenterJudgment criteria
+  ExperimenterJudgment criteria; `shaping <Label>:` blocks with
+  artful / percentile methods, stable() and sessions criteria;
+  `experiment <Label>:` paper blocks (single-schedule or phase-
+  sequence body, with per-experiment annotation overrides); `use
+  <Label>` phase-reference resolution; digit-form phase and experiment
+  labels
+- **Composed** — autoshape, omission, two-process-theory,
+  conditioned-suppression, pit (phase-wrapped respondent / compound
+  procedures)
+- **Analyzer** — binding-expansion pass that substitutes `let`-bound
+  IdentifierRef nodes with their values throughout the schedule tree
 
 Not yet exercised:
 
-- Composed fixtures that wrap a Conc/Mult host in a phase block
-  (conditioned-suppression, pit)
-- Experiment layer `shaping <Label>:`, `progressive <Label>:`, and
-  `experiment <Label>:` paper blocks
-- Semantic analyzer (binding expansion, LH propagation, reserved-word
-  checks, warning channel, `use <Label>` phase reference resolution)
+- Experiment layer `progressive <Label>:` block template expansion
+  (`steps v = [...]` placeholder substitution)
+- Staged shaping (`method = staged, stages = [CRF, DRH2s, DRH1s]`)
+- `SecondOrder` with an `IdentifierRef` as overall or unit
 - Error-code channel for `expected_error` fixtures
-- A handful of annotation-dependent fixtures across aversive, respondent,
-  trial-based, and procedure-trial-structure layers that require
-  declaration-mode MTS with stimulus classes, structured probe-policy
-  payloads, or correction-procedure metadata
 
 ## Usage
 

@@ -12,37 +12,43 @@
 [`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
 に対する実装を進行中。`contingency-dsl-py` との全面パリティをタグ付けの目標とする。
 
-現時点で conformance に対して形状一致を確認しているカテゴリ（各 fixture の
-`pre_expansion` または `expected` ペイロードとのサブセットマッチ）：
+Conformance 合格率は現在 **98.3%**（474 fixture 中 466 合格）。
+合格対象（fixture の `pre_expansion` または `expected` ペイロードに対する
+サブセットマッチ）：
 
 - **Operant コア** — atomic、special（EXT / CRF）、second-order、compound
   （全 combinator、位置引数、スカラー kwargs COD / FRCO / BO、PUNISH の 3 形式、
   directional COD、Overlay target、Interpolate count / onset）、
   DR / PR / Pctl / Lag / Repeat modifier、LimitedHold 後置、
   TO / ResponseCost 後置、`let` バインディング、プログラム単位パラメータ宣言
-- **嫌悪スケジュール** — Sidman、DiscrimAv、Escape と別名、必須パラメータ
-  の検証（注釈依存ケースは未対応）
+- **嫌悪スケジュール** — Sidman、DiscrimAv、Escape と別名、必須パラメータ検証
 - **状態依存** — Adjusting、Interlocking、Percentile
-- **試行ベース** — MTS、GoNoGo とデフォルト値
+- **試行ベース** — MTS、GoNoGo（デフォルト値・correction-mode まで）
 - **Respondent Tier A** — Pair.{ForwardDelay, ForwardTrace, Simultaneous,
-  Backward}、Extinction、CSOnly、USOnly、Contingency（両引数形式）、
-  TrulyRandom、ExplicitlyUnpaired、Compound、Serial、ITI、Differential
+  Backward}、Extinction、CSOnly、USOnly、Contingency（3 形式）、
+  TrulyRandom（p 対応）、ExplicitlyUnpaired、Compound（mode 付）、Serial、
+  ITI、Differential（full / short）
 - **Annotation** — `@keyword(...)` をプログラム／スケジュールスコープで解析。
   位置文字列、kwarg、時間単位／パーセント付き数値、リスト／オブジェクトリテラル、
-  負の数値、別名正規化（punisher → reinforcer など）に対応
-- **Experiment** — `phase <Label>:` ブロックを FixedSessions、
-  Stability（visual / cv / rate / iri / latency）、ExperimenterJudgment の
-  基準で解釈
+  負の数値、別名正規化（punisher → reinforcer など）に対応。
+  `trial_mix`／declaration-mode MTS 上の `training`・`testing` は
+  schedule-scope にルーティング
+- **Experiment** — `phase <Label>:` ブロック（FixedSessions、Stability、
+  ExperimenterJudgment）、`shaping <Label>:` ブロック（artful / percentile、
+  stable()、sessions 基準対応）、`experiment <Label>:` paper ブロック
+  （単一スケジュール／phase-sequence body、experiment 単位の注釈
+  オーバーライド対応）、`use <Label>` フェーズ参照の解決、digit-form label
+- **Composed** — autoshape、omission、two-process-theory、
+  conditioned-suppression、pit
+- **Analyzer** — `let` 束縛を schedule ツリー全体に展開する binding 展開
 
-未対応：
+未対応（残り 8 fixture）：
 
-- Phase-block で Conc/Mult を包む composed 手続き
-  （conditioned-suppression、pit）
-- Experiment 層の `shaping`、`progressive`、`experiment` ブロック（Paper）
-- 意味解析器（binding 展開、LH 伝搬、予約語チェック、warning チャネル、
-  `use <Label>` フェーズ参照の解決）
+- Experiment 層 `progressive <Label>:` のテンプレート展開
+  （`steps v = [...]` プレースホルダ置換）
+- Staged shaping（`method = staged, stages = [...]`）
+- `SecondOrder` の overall / unit 位置に `IdentifierRef` を許容する AST 拡張
 - `expected_error` fixture 用エラーコードチャネル
-- declaration-mode MTS や probe_policy 等の複雑注釈に依存する一部 fixture
 
 ## 使い方
 
