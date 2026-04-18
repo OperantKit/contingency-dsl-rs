@@ -4087,6 +4087,164 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                 }
             }
         }
+        "session" => {
+            if let Some(params) = params {
+                let has_trials = params.contains_key("trials");
+                let has_blocks = params.contains_key("blocks");
+                let has_block_size = params.contains_key("block_size");
+                if !has_trials && !has_blocks && !has_block_size {
+                    return Err(DslError::semantic("SESSION_MISSING_PARAM", span));
+                }
+                if let Some(AnnotationValue::Int(n)) = params.get("trials") {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("SESSION_NONPOSITIVE_TRIALS: {}", n),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Int(n)) = params.get("blocks") {
+                    if *n <= 0 {
+                        return Err(DslError::semantic(
+                            format!("SESSION_NONPOSITIVE_BLOCKS: {}", n),
+                            span,
+                        ));
+                    }
+                }
+                if has_blocks && !has_block_size && !has_trials {
+                    return Err(DslError::semantic(
+                        "SESSION_BLOCKS_WITHOUT_BLOCK_SIZE",
+                        span,
+                    ));
+                }
+                if let (
+                    Some(AnnotationValue::Int(trials)),
+                    Some(AnnotationValue::Int(blocks)),
+                    Some(AnnotationValue::Int(block_size)),
+                ) = (
+                    params.get("trials"),
+                    params.get("blocks"),
+                    params.get("block_size"),
+                ) {
+                    if trials != &(blocks * block_size) {
+                        return Err(DslError::semantic(
+                            format!(
+                                "SESSION_BLOCK_TRIALS_MISMATCH: trials={} blocks={} block_size={}",
+                                trials, blocks, block_size
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "probe_policy" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Float(r)) = params.get("probe_ratio") {
+                    if !(0.0..=1.0).contains(r) {
+                        return Err(DslError::semantic(
+                            format!("PROBE_POLICY_INVALID_RATIO: {}", r),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Str(order)) = params.get("order") {
+                    let interspersed = matches!(
+                        params.get("interspersed"),
+                        Some(AnnotationValue::Json(JsonValue::Bool(true)))
+                    );
+                    if interspersed && order == "blocked" {
+                        return Err(DslError::semantic(
+                            "PROBE_POLICY_INCONSISTENT_INTERSPERSED_ORDER",
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        "training" | "testing" => {
+            let prefix = if a.keyword == "training" { "TRAINING" } else { "TESTING" };
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Array(rels))) =
+                    params.get("relations")
+                {
+                    if rels.is_empty() {
+                        return Err(DslError::semantic(
+                            format!("{}_EMPTY_RELATIONS", prefix),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Int(c)) = params.get("criterion") {
+                    if *c <= 0 || *c > 100 {
+                        return Err(DslError::semantic(
+                            format!("{}_INVALID_CRITERION: {}", prefix, c),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Int(bs)) = params.get("block_size") {
+                    if *bs <= 0 {
+                        return Err(DslError::semantic(
+                            format!("{}_NONPOSITIVE_BLOCK_SIZE: {}", prefix, bs),
+                            span,
+                        ));
+                    }
+                }
+                if prefix == "TESTING" {
+                    if let Some(AnnotationValue::Float(r)) = params.get("probe_ratio") {
+                        if !(0.0..=1.0).contains(r) {
+                            return Err(DslError::semantic(
+                                format!("TESTING_INVALID_PROBE_RATIO: {}", r),
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "reinforcer" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Str(t)) = params.get("type") {
+                    // 'primary' is folk psychology; fixtures require
+                    // 'unconditioned' instead.
+                    if t == "primary" {
+                        return Err(DslError::semantic(
+                            format!("REINFORCER_UNKNOWN_TYPE: '{}'", t),
+                            span,
+                        ));
+                    }
+                }
+                if let Some(AnnotationValue::Json(JsonValue::Object(d))) =
+                    params.get("duration")
+                {
+                    if let Some(JsonValue::Float(v)) = d.get("value") {
+                        if *v < 0.0 {
+                            return Err(DslError::semantic(
+                                format!("REINFORCER_NEGATIVE_DURATION: {}", v),
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "warmup" => {
+            if let Some(params) = params {
+                if let Some(AnnotationValue::Json(JsonValue::Object(d))) =
+                    params.get("duration")
+                {
+                    if let Some(JsonValue::Float(v)) = d.get("value") {
+                        if *v <= 0.0 {
+                            return Err(DslError::semantic(
+                                format!("WARMUP_NONPOSITIVE_DURATION: {}", v),
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         "stimulus_classes" => {
             if let Some(AnnotationValue::Int(n)) = &a.positional {
                 if *n < 2 {
