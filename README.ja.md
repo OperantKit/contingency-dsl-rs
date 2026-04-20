@@ -4,7 +4,29 @@
 
 [contingency-dsl](../contingency-dsl/) の Rust リファレンスパーサ。
 
-外部ランタイム依存ゼロ。Python リファレンス実装 [`../contingency-dsl-py`](../contingency-dsl-py/) をミラーする。
+外部ランタイム依存ゼロ。Python リファレンス実装 [`../contingency-dsl-py`](../contingency-dsl-py/) をミラーし、コア アノテーション拡張も同梱する。
+
+## アノテーション拡張
+
+6 種のコア annotator（`stimulus`, `temporal`, `subjects`, `apparatus`,
+`composed`, `measurement`）は `contingency_dsl::annotations` 配下に
+同梱されている。Python リファレンス実装をミラーする:
+
+```rust
+use contingency_dsl::annotations::{StimulusExtension, MeasurementExtension};
+use contingency_dsl::extensions::ExtensionRegistry;
+
+let registry = ExtensionRegistry::build(vec![
+    Box::new(StimulusExtension::default()),
+    Box::new(MeasurementExtension::default()),
+])?;
+```
+
+`AnnotationExtension` trait と `ExtensionRegistry` は
+[`src/extensions.rs`](src/extensions.rs) に定義されている
+（Kahn 法による `requires()` トポロジカルソート、キーワード
+disjointness 検査）。サードパーティの crate は本 trait を実装して
+ビルトインと並列に登録できる。
 
 ## 状態
 

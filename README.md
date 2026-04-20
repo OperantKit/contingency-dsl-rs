@@ -5,7 +5,29 @@
 Rust reference parser for [contingency-dsl](../contingency-dsl/).
 
 Zero external runtime dependencies. Mirrors the Python reference
-implementation in [`../contingency-dsl-py`](../contingency-dsl-py/).
+implementation in [`../contingency-dsl-py`](../contingency-dsl-py/),
+including the core annotation extensions.
+
+## Annotation extensions
+
+Six core annotation modules ship under `contingency_dsl::annotations`
+— `stimulus`, `temporal`, `subjects`, `apparatus`, `composed`,
+`measurement` — mirroring the Python reference implementations:
+
+```rust
+use contingency_dsl::annotations::{StimulusExtension, MeasurementExtension};
+use contingency_dsl::extensions::ExtensionRegistry;
+
+let registry = ExtensionRegistry::build(vec![
+    Box::new(StimulusExtension::default()),
+    Box::new(MeasurementExtension::default()),
+])?;
+```
+
+The `AnnotationExtension` trait plus `ExtensionRegistry` (Kahn
+topological sort over `requires()`, keyword-disjointness enforcement)
+live in [`src/extensions.rs`](src/extensions.rs). Third-party crates can
+implement the trait and compose alongside the built-ins.
 
 ## Status
 
