@@ -30,17 +30,19 @@ disjointness 検査)。サードパーティの crate は本 trait を実装し�
 
 ## 適合テスト
 
-テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、5 つの面を調べる:
+テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、6 つの面を調べる:
 
 - **shape** — `expected` / `pre_expansion` のあるケースが、対応する JSON の形になる
 - **warning** — `warnings` のあるケースで、挙げられた各コードが `collect_warnings()` から出る
 - **error** — `error` / `expected_error` のあるケースが、kind と code の一致する `DslError` になるか、そのコードの診断が出る。`@clock`・`@warmup`・`@algorithm`・`@deprivation`・`@n` の値はパーサが受理し、注釈の検査器が報告する。これらのコードは検査器から出る
 - **diagnostics** — 注釈のケースで `expected_diagnostics` のあるものは構文解析が通り、挙げられた各コードを拡張の registry が報告する (この crate でも Python の検査器でも出ない 4 件は [`tests/conformance_annotations.rs`](tests/conformance_annotations.rs) に並べてある)
 - **algebra** — `lhs` / `rhs` / `relation` のあるケースで両辺を簡約し、`equivalent` なら Conc / Alt / Conj の成分の順序を除いて同じ結果になる (`not_equivalent` なら異なる)
+- **t-tau** — `representations/t-tau/` のケースが、対応する T-τ のパラメータかスケジュールに変換され、注釈を保ち、誤りのケースは対応する誤りで拒否される
 
 まだ読んでいない物:
 
-- `representations/` (T-τ スケジュール変換)
+- `equivalence/` (実行して比べるプログラムの組)
+- 期待値が `errors` の一覧で書かれたケース (`operant/errors.json`・`experiment/errors.json`) と、`expected_phase_count` / `expected_labels` で書かれたケース (`experiment/`)、`expected_error` がオブジェクトのケース (`experiment/paper.json`)
 
 対応カテゴリ：
 
@@ -77,6 +79,13 @@ disjointness 検査)。サードパーティの crate は本 trait を実装し�
   簡約しない。キーワード引数のある複合スケジュールは平坦化も縮約もせず、
   Chain の CRF は先頭のものだけを落とす。contingency-dsl-py の `analyze` は
   これらも書き換えるので、そこでは結果が異なることがある
+- **Representations** — `to_ttau` は Interval / Time のアトミックスケジュールを
+  T-τ のパラメータに変換し、`from_ttau` は元に戻す (τ < T なら limited hold が
+  付く)。どちらも注釈を保つ。`approximate_ttau` は Ratio のスケジュールを、
+  宣言した反応間時間の下で近似し、注釈は受け取らない。T と τ は秒で、`ms` や
+  `min` のスケジュールは拒否する (contingency-dsl-py は数値をそのまま使う)。
+  有限でない値と、`approximate_ttau` に渡した Interval / Time も拒否する
+  (contingency-dsl-py はこれらも受理する)
 
 ## 使い方
 

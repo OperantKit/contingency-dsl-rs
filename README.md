@@ -37,7 +37,7 @@ implement the trait and compose alongside the built-ins.
 
 The test suite reads the language-independent cases in
 [contingency-dsl's `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance)
-and checks five channels:
+and checks six channels:
 
 - **shape** — fixtures with `expected` / `pre_expansion` produce the
   matching JSON shape
@@ -55,10 +55,17 @@ and checks five channels:
 - **algebra** — fixtures with `lhs` / `rhs` / `relation`: both sides are
   simplified, and for `equivalent` the results are the same up to the order
   of the components of Conc / Alt / Conj (for `not_equivalent`, they differ)
+- **t-tau** — fixtures under `representations/t-tau/` convert to the expected
+  T-τ parameters or schedule, keep their annotations, and are rejected with
+  the expected error
 
 Not read yet:
 
-- `representations/` (T-τ schedule conversions)
+- `equivalence/` (programs compared by running them)
+- cases whose expectation is written as a list of `errors`
+  (`operant/errors.json`, `experiment/errors.json`), as
+  `expected_phase_count` / `expected_labels` (`experiment/`), or as an
+  `expected_error` object (`experiment/paper.json`)
 
 Exercised fixture categories:
 
@@ -105,6 +112,14 @@ Exercised fixture categories:
   arguments are not flattened or collapsed, and of the CRF links of a Chain
   only leading ones are dropped. contingency-dsl-py's `analyze` also
   rewrites these, so the two can differ there
+- **Representations** — `to_ttau` converts an atomic Interval / Time
+  schedule to the T-τ parameters, and `from_ttau` back (with a limited hold
+  when τ < T); both keep annotations. `approximate_ttau` turns a Ratio
+  schedule into an approximation under a declared inter-response time, and
+  takes no annotations. T and τ are in seconds: a schedule in `ms` or `min`
+  is rejected, where contingency-dsl-py takes its number as it is. Values
+  that are not finite, and Interval / Time schedules given to
+  `approximate_ttau`, are rejected; contingency-dsl-py accepts these too
 
 ## Usage
 

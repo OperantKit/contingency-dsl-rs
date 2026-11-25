@@ -12,6 +12,7 @@ pub mod experiment;
 pub mod extensions;
 pub mod lexer;
 pub mod parser;
+pub mod representations;
 pub mod respondent_parser;
 pub mod serializer;
 pub mod tokens;
@@ -28,6 +29,9 @@ pub use extensions::{
 };
 pub use lexer::tokenize;
 pub use parser::{collect_warnings, expand_bindings, parse, parse_top_level, TopLevel};
+pub use representations::{
+    approximate_ttau, from_ttau, to_ttau, IrtAssumption, TTauApprox, TTauError, TTauParams,
+};
 pub use serializer::{
     expr_to_json, json_to_string, paper_to_json, phase_sequence_to_json, program_to_json,
 };
