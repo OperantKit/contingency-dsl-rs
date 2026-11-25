@@ -2,7 +2,8 @@
 //! `../contingency-dsl/conformance/**/*.json` and report which cases this
 //! implementation currently matches.
 //!
-//! The harness checks four conformance channels:
+//! The harness checks four conformance channels. A shape / error / warning
+//! case is identified by its `input`, an algebra case by `lhs` / `rhs`:
 //!
 //! 1. shape match — fixtures with `expected` or `pre_expansion` must parse
 //!    successfully and produce the matching JSON shape under subset
@@ -13,7 +14,10 @@
 //!    validators);
 //! 3. warning channel — fixtures with a `warnings` list must accumulate a
 //!    diagnostic containing each listed code during analyzer expansion;
-//! 4. algebraic fixtures (`lhs` / `rhs` / `relation`) are skipped.
+//! 4. algebra channel — fixtures with `lhs` / `rhs` / `relation` must parse
+//!    on both sides, and the two simplified programs must (or, for
+//!    `not_equivalent`, must not) be the same up to the order of the
+//!    components of Conc / Alt / Conj.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,8 +28,8 @@ use contingency_dsl::annotations::measurement::{
 };
 use contingency_dsl::ast::JsonValue as AstValue;
 use contingency_dsl::{
-    expand_bindings, paper_to_json, parse_top_level, phase_sequence_to_json, program_to_json,
-    TopLevel,
+    expand_bindings, paper_to_json, parse, parse_top_level, phase_sequence_to_json,
+    program_to_json, simplify_algebra, TopLevel,
 };
 use serde_json::Value as JsonV;
 
@@ -105,20 +109,95 @@ fn json_subset(actual: &JsonV, expected: &JsonV) -> bool {
     }
 }
 
-#[derive(Default)]
+/// Sort the components of Conc / Alt / Conj (Theorem 1) so that two orders
+/// compare equal. The components of the other combinators keep their order.
+fn commutative_canonical(v: &JsonV) -> JsonV {
+    match v {
+        JsonV::Array(xs) => JsonV::Array(xs.iter().map(commutative_canonical).collect()),
+        JsonV::Object(m) => {
+            let mut out: serde_json::Map<String, JsonV> = m
+                .iter()
+                .map(|(k, x)| (k.clone(), commutative_canonical(x)))
+                .collect();
+            let commutative = out.get("type").and_then(|t| t.as_str()) == Some("Compound")
+                && matches!(
+                    out.get("combinator").and_then(|c| c.as_str()),
+                    Some("Conc" | "Alt" | "Conj")
+                );
+            if commutative {
+                if let Some(JsonV::Array(components)) = out.get_mut("components") {
+                    components.sort_by_key(|c| c.to_string());
+                }
+            }
+            JsonV::Object(out)
+        }
+        _ => v.clone(),
+    }
+}
+
+/// Check one `lhs` / `rhs` / `relation` case. A side that does not parse or
+/// an unknown relation is a mismatch, also for `not_equivalent`.
+fn algebra_case_matches(lhs: &str, rhs: &str, relation: &str) -> bool {
+    let normal_form = |source: &str| {
+        parse(source).ok().map(|p| {
+            let simplified = simplify_algebra(p);
+            commutative_canonical(&ast_value_to_serde(&program_to_json(&simplified)))
+        })
+    };
+    let (Some(l), Some(r)) = (normal_form(lhs), normal_form(rhs)) else {
+        return false;
+    };
+    match relation {
+        "equivalent" => l == r,
+        "not_equivalent" => l != r,
+        _ => false,
+    }
+}
+
+/// Passed / total counts of one channel.
+#[derive(Default, Clone, Copy)]
+struct Count {
+    pass: usize,
+    total: usize,
+}
+
+impl Count {
+    fn add(&mut self, matched: bool) {
+        self.total += 1;
+        if matched {
+            self.pass += 1;
+        }
+    }
+
+    fn merge(&mut self, other: Count) {
+        self.pass += other.pass;
+        self.total += other.total;
+    }
+}
+
+#[derive(Default, Clone, Copy)]
 struct Stats {
-    // Shape channel
-    shape_total: usize,
-    shape_match: usize,
-    // Error channel
-    error_total: usize,
-    error_match: usize,
-    // Warning channel
-    warning_total: usize,
-    warning_match: usize,
-    // Per-file breakdown: (shape_pass, shape_total, error_pass, error_total,
-    // warning_pass, warning_total)
-    per_file: BTreeMap<String, (usize, usize, usize, usize, usize, usize)>,
+    shape: Count,
+    error: Count,
+    warning: Count,
+    algebra: Count,
+}
+
+impl Stats {
+    fn merge(&mut self, other: Stats) {
+        self.shape.merge(other.shape);
+        self.error.merge(other.error);
+        self.warning.merge(other.warning);
+        self.algebra.merge(other.algebra);
+    }
+
+    fn grand(&self) -> Count {
+        let mut all = self.shape;
+        all.merge(self.error);
+        all.merge(self.warning);
+        all.merge(self.algebra);
+        all
+    }
 }
 
 #[test]
@@ -129,7 +208,7 @@ fn conformance_coverage_report() {
         return;
     }
     let fixtures = collect_fixtures(&root);
-    let mut stats = Stats::default();
+    let mut per_file: BTreeMap<String, Stats> = BTreeMap::new();
 
     for path in &fixtures {
         let data = fs::read_to_string(path).expect("read fixture");
@@ -149,16 +228,23 @@ fn conformance_coverage_report() {
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        let mut row = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut row = Stats::default();
 
         for case in cases {
             let JsonV::Object(obj) = case else { continue };
-            let Some(JsonV::String(input)) = obj.get("input") else { continue };
-            // Algebraic equivalence fixtures are skipped (py runs them
-            // through a separate comparator).
+
+            // Algebra channel: a pair of expressions instead of one `input`.
             if obj.contains_key("lhs") && obj.contains_key("rhs") {
+                let text = |key: &str| obj.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                let matched = algebra_case_matches(text("lhs"), text("rhs"), text("relation"));
+                if !matched {
+                    eprintln!("algebra mismatch: {}: {}", rel, text("id"));
+                }
+                row.algebra.add(matched);
                 continue;
             }
+
+            let Some(JsonV::String(input)) = obj.get("input") else { continue };
 
             // Error channel: fixture has an `error` object or `expected_error`.
             let error_info = normalize_error(&obj);
@@ -169,8 +255,6 @@ fn conformance_coverage_report() {
                 .cloned();
 
             if let Some((etype, ecode)) = error_info {
-                stats.error_total += 1;
-                row.3 += 1;
                 let parse_result = parse_top_level(input);
                 let matched = match &parse_result {
                     Err(e) => {
@@ -215,16 +299,11 @@ fn conformance_coverage_report() {
                             .unwrap_or(false)
                     }
                 };
-                if matched {
-                    stats.error_match += 1;
-                    row.2 += 1;
-                }
+                row.error.add(matched);
                 continue;
             }
 
             if !expected_warnings.is_empty() {
-                stats.warning_total += 1;
-                row.5 += 1;
                 let diags = match parse_top_level(input) {
                     Ok(top) => collect_diagnostics(&top),
                     Err(_) => Vec::new(),
@@ -232,10 +311,7 @@ fn conformance_coverage_report() {
                 let matched = expected_warnings
                     .iter()
                     .all(|code| diags.iter().any(|d| d == code));
-                if matched {
-                    stats.warning_match += 1;
-                    row.4 += 1;
-                }
+                row.warning.add(matched);
                 // Fall through — some warning fixtures also have an
                 // `expected` shape that should be verified.
             }
@@ -243,12 +319,12 @@ fn conformance_coverage_report() {
             let Some(want) = want_shape else {
                 continue;
             };
-            stats.shape_total += 1;
-            row.1 += 1;
-
             let top = match parse_top_level(input) {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(_) => {
+                    row.shape.add(false);
+                    continue;
+                }
             };
             let got_ast = match &top {
                 TopLevel::Program(p) => program_to_json(p),
@@ -268,43 +344,42 @@ fn conformance_coverage_report() {
                     }
                 }
             }
-            if matched {
-                stats.shape_match += 1;
-                row.0 += 1;
-            }
+            row.shape.add(matched);
         }
 
-        let covered = row.1 + row.3 + row.5;
-        if covered > 0 {
-            stats.per_file.insert(rel, row);
+        if row.grand().total > 0 {
+            per_file.insert(rel, row);
         }
     }
 
+    let mut stats = Stats::default();
+    for row in per_file.values() {
+        stats.merge(*row);
+    }
+    let total = |c: Count| format!("{} / {}", c.pass, c.total);
     eprintln!();
     eprintln!("== contingency-dsl-rs conformance report ==");
-    eprintln!("shape channel   : {} / {}", stats.shape_match, stats.shape_total);
-    eprintln!("error channel   : {} / {}", stats.error_match, stats.error_total);
-    eprintln!("warning channel : {} / {}", stats.warning_match, stats.warning_total);
-    eprintln!(
-        "grand total     : {} / {}",
-        stats.shape_match + stats.error_match + stats.warning_match,
-        stats.shape_total + stats.error_total + stats.warning_total
-    );
+    eprintln!("shape channel   : {}", total(stats.shape));
+    eprintln!("error channel   : {}", total(stats.error));
+    eprintln!("warning channel : {}", total(stats.warning));
+    eprintln!("algebra channel : {}", total(stats.algebra));
+    eprintln!("grand total     : {}", total(stats.grand()));
     eprintln!();
-    eprintln!("per-file pass rate (shape | error | warning):");
-    for (file, (sp, st, ep, et, wp, wt)) in &stats.per_file {
-        let seg = |p: usize, t: usize| {
-            if t == 0 {
+    eprintln!("per-file pass rate (shape | error | warning | algebra):");
+    for (file, row) in &per_file {
+        let seg = |c: Count| {
+            if c.total == 0 {
                 "     -".to_string()
             } else {
-                format!("{:>3}/{:>3}", p, t)
+                format!("{:>3}/{:>3}", c.pass, c.total)
             }
         };
         eprintln!(
-            "  {} | {} | {}   {}",
-            seg(*sp, *st),
-            seg(*ep, *et),
-            seg(*wp, *wt),
+            "  {} | {} | {} | {}   {}",
+            seg(row.shape),
+            seg(row.error),
+            seg(row.warning),
+            seg(row.algebra),
             file
         );
     }

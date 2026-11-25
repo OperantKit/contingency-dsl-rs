@@ -37,7 +37,7 @@ implement the trait and compose alongside the built-ins.
 
 The test suite reads the language-independent cases in
 [contingency-dsl's `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance)
-and checks four channels:
+and checks five channels:
 
 - **shape** — fixtures with `expected` / `pre_expansion` produce the
   matching JSON shape
@@ -52,11 +52,13 @@ and checks four channels:
   and the extension registry reports each listed code (four cases whose
   code neither this crate nor the Python validators report are listed in
   [`tests/conformance_annotations.rs`](tests/conformance_annotations.rs))
+- **algebra** — fixtures with `lhs` / `rhs` / `relation`: both sides are
+  simplified, and for `equivalent` the results are the same up to the order
+  of the components of Conc / Alt / Conj (for `not_equivalent`, they differ)
 
 Not read yet:
 
-- `operant/algebra.json` (`lhs` / `rhs` / `relation` cases) and
-  `representations/` (T-τ schedule conversions)
+- `representations/` (T-τ schedule conversions)
 
 Exercised fixture categories:
 
@@ -96,7 +98,13 @@ Exercised fixture categories:
   procedures)
 - **Analyzer** — binding-expansion pass that substitutes `let`-bound
   IdentifierRef nodes with their values throughout the schedule tree,
-  including inside `SecondOrder` overall and unit slots
+  including inside `SecondOrder` overall and unit slots; and, on request,
+  `simplify_algebra`, which applies the rewrite rules of the operant theory
+  (identity and annihilator elements, flattening of nested compounds,
+  `Repeat` expansion). Parsing never simplifies. Compounds with keyword
+  arguments are not flattened or collapsed, and of the CRF links of a Chain
+  only leading ones are dropped. contingency-dsl-py's `analyze` also
+  rewrites these, so the two can differ there
 
 ## Usage
 

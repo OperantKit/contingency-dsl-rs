@@ -3,6 +3,7 @@
 //! See `../contingency-dsl/` for the language specification. The Python
 //! reference implementation lives in `../contingency-dsl-py`.
 
+pub mod algebra;
 pub mod annotations;
 pub mod ast;
 pub mod enums;
@@ -15,6 +16,7 @@ pub mod respondent_parser;
 pub mod serializer;
 pub mod tokens;
 
+pub use algebra::simplify_algebra;
 pub use annotations::{
     ApparatusExtension, ComposedExtension, MeasurementExtension, StimulusExtension,
     SubjectsExtension, TemporalExtension,

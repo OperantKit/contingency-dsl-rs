@@ -30,16 +30,17 @@ disjointness 検査)。サードパーティの crate は本 trait を実装し�
 
 ## 適合テスト
 
-テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、4 つの面を調べる:
+テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、5 つの面を調べる:
 
 - **shape** — `expected` / `pre_expansion` のあるケースが、対応する JSON の形になる
 - **warning** — `warnings` のあるケースで、挙げられた各コードが `collect_warnings()` から出る
 - **error** — `error` / `expected_error` のあるケースが、kind と code の一致する `DslError` になるか、そのコードの診断が出る。`@clock`・`@warmup`・`@algorithm`・`@deprivation`・`@n` の値はパーサが受理し、注釈の検査器が報告する。これらのコードは検査器から出る
 - **diagnostics** — 注釈のケースで `expected_diagnostics` のあるものは構文解析が通り、挙げられた各コードを拡張の registry が報告する (この crate でも Python の検査器でも出ない 4 件は [`tests/conformance_annotations.rs`](tests/conformance_annotations.rs) に並べてある)
+- **algebra** — `lhs` / `rhs` / `relation` のあるケースで両辺を簡約し、`equivalent` なら Conc / Alt / Conj の成分の順序を除いて同じ結果になる (`not_equivalent` なら異なる)
 
 まだ読んでいない物:
 
-- `operant/algebra.json` (`lhs` / `rhs` / `relation` のケース) と `representations/` (T-τ スケジュール変換)
+- `representations/` (T-τ スケジュール変換)
 
 対応カテゴリ：
 
@@ -70,7 +71,12 @@ disjointness 検査)。サードパーティの crate は本 trait を実装し�
 - **Composed** — autoshape、omission、two-process-theory、
   conditioned-suppression、pit
 - **Analyzer** — `let` 束縛を schedule ツリー全体および `SecondOrder`
-  overall / unit 位置に展開する binding 展開
+  overall / unit 位置に展開する binding 展開。呼んだときだけ働く
+  `simplify_algebra` は、オペラントの理論の書き換え規則 (単位元・零元、
+  入れ子の複合スケジュールの平坦化、`Repeat` の展開) を当てる。構文解析は
+  簡約しない。キーワード引数のある複合スケジュールは平坦化も縮約もせず、
+  Chain の CRF は先頭のものだけを落とす。contingency-dsl-py の `analyze` は
+  これらも書き換えるので、そこでは結果が異なることがある
 
 ## 使い方
 
