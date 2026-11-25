@@ -2,17 +2,21 @@
 
 :jp: [日本語版 README](README.ja.md)
 
-Rust reference parser for [contingency-dsl](../contingency-dsl/).
+Rust reference parser for [contingency-dsl](https://github.com/OperantKit/contingency-dsl):
+text in, syntax tree out. It is the second reference parser, reading the
+same grammar as the Python one
+([contingency-dsl-py](https://github.com/OperantKit/contingency-dsl-py)). The
+two count as the same language by passing the conformance cases of
+contingency-dsl.
 
-Zero external runtime dependencies. Mirrors the Python reference
-implementation in [`../contingency-dsl-py`](../contingency-dsl-py/),
-including the core annotation extensions.
+Zero external runtime dependencies. The six core annotation extensions
+are included.
 
 ## Annotation extensions
 
 Six core annotation modules ship under `contingency_dsl::annotations`
 — `stimulus`, `temporal`, `subjects`, `apparatus`, `composed`,
-`measurement` — mirroring the Python reference implementations:
+`measurement` — the same six as in contingency-dsl-py:
 
 ```rust
 use contingency_dsl::annotations::{StimulusExtension, MeasurementExtension};
@@ -29,19 +33,25 @@ topological sort over `requires()`, keyword-disjointness enforcement)
 live in [`src/extensions.rs`](src/extensions.rs). Third-party crates can
 implement the trait and compose alongside the built-ins.
 
-## Status
+## Conformance
 
-Conformance against the language-independent suite at
-[`../contingency-dsl/conformance/`](../contingency-dsl/conformance/)
-covers three channels — **all 100% passing**:
+The test suite reads the language-independent cases in
+[contingency-dsl's `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance)
+and checks three channels:
 
 - **shape** — fixtures with `expected` / `pre_expansion` produce the
-  matching JSON shape: **542 / 542**
+  matching JSON shape
 - **warning** — fixtures with `warnings` emit each listed code via
-  `collect_warnings()`: **69 / 69**
+  `collect_warnings()`
 - **error** — fixtures with `error` / `expected_error` produce a
-  `DslError` whose kind and code match: **383 / 383**
-- **total**: **994 / 994** (100%)
+  `DslError` whose kind and code match
+
+Not matched or not read yet:
+
+- some cases in `annotations/procedure-temporal.json` and
+  `annotations/subjects.json` do not produce the expected shape
+- `operant/algebra.json` (`lhs` / `rhs` / `relation` cases) and
+  `representations/` (T-τ schedule conversions) are not read
 
 Exercised fixture categories:
 
@@ -83,10 +93,6 @@ Exercised fixture categories:
   IdentifierRef nodes with their values throughout the schedule tree,
   including inside `SecondOrder` overall and unit slots
 
-The `representations/` fixtures (T-τ schedule conversions) are a
-separate test module in the Python reference; they are not exercised
-by this crate's harness.
-
 ## Usage
 
 ```rust
@@ -118,13 +124,19 @@ let tokens = tokenize("FR 10").unwrap();
 
 ## Testing
 
+The conformance tests read a clone of contingency-dsl placed next to this
+repository:
+
 ```bash
+git clone https://github.com/OperantKit/contingency-dsl
+git clone https://github.com/OperantKit/contingency-dsl-rs
+cd contingency-dsl-rs
 cargo test
 ```
 
 The conformance harness at [`tests/conformance.rs`](tests/conformance.rs)
-walks every fixture in the language spec and prints a per-file pass
-rate. Run it with output visible:
+prints a per-file pass rate. It is a report: a case that does not match
+does not fail the test. Run it with output visible:
 
 ```bash
 cargo test --test conformance -- --nocapture

@@ -2,15 +2,15 @@
 
 :gb: [English README](README.md)
 
-[contingency-dsl](../contingency-dsl/) の Rust リファレンスパーサ。
+[contingency-dsl](https://github.com/OperantKit/contingency-dsl) の Rust のリファレンスパーサ。文字列を読み、構文木を返す。Python 版 ([contingency-dsl-py](https://github.com/OperantKit/contingency-dsl-py)) と同じ文法を読む、もう 1 つのリファレンスパーサである。どちらも contingency-dsl の適合テスト (conformance tests) に合格することで同じ言語とみなす。
 
-外部ランタイム依存ゼロ。Python リファレンス実装 [`../contingency-dsl-py`](../contingency-dsl-py/) をミラーし、コア アノテーション拡張も同梱する。
+実行時に依存する外部の crate は無い。中核のアノテーション拡張 6 種を同梱する。
 
 ## アノテーション拡張
 
-6 種のコア annotator（`stimulus`, `temporal`, `subjects`, `apparatus`,
-`composed`, `measurement`）は `contingency_dsl::annotations` 配下に
-同梱されている。Python リファレンス実装をミラーする:
+6 種のコア annotator (`stimulus`, `temporal`, `subjects`, `apparatus`,
+`composed`, `measurement`) は `contingency_dsl::annotations` 配下に
+同梱されている。contingency-dsl-py と同じ 6 種である:
 
 ```rust
 use contingency_dsl::annotations::{StimulusExtension, MeasurementExtension};
@@ -24,55 +24,53 @@ let registry = ExtensionRegistry::build(vec![
 
 `AnnotationExtension` trait と `ExtensionRegistry` は
 [`src/extensions.rs`](src/extensions.rs) に定義されている
-（Kahn 法による `requires()` トポロジカルソート、キーワード
-disjointness 検査）。サードパーティの crate は本 trait を実装して
+(Kahn 法による `requires()` トポロジカルソート、キーワード
+disjointness 検査)。サードパーティの crate は本 trait を実装して
 ビルトインと並列に登録できる。
 
-## 状態
+## 適合テスト
 
-Conformance は 3 チャネル全てで **100%**：
+テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、3 つの面を調べる:
 
-- **shape** — `expected` / `pre_expansion` との一致: **542 / 542**
-- **warning** — `warnings` 宣言との一致: **69 / 69**
-- **error** — `error` / `expected_error` の kind+code 一致: **383 / 383**
-- **合計**: **994 / 994** (100%)
+- **shape** — `expected` / `pre_expansion` のあるケースが、対応する JSON の形になる
+- **warning** — `warnings` のあるケースで、挙げられた各コードが `collect_warnings()` から出る
+- **error** — `error` / `expected_error` のあるケースが、kind と code の一致する `DslError` になる
+
+まだ一致しない、または読んでいない物:
+
+- `annotations/procedure-temporal.json` と `annotations/subjects.json` の一部のケースが、期待される形にならない
+- `operant/algebra.json` (`lhs` / `rhs` / `relation` のケース) と `representations/` (T-τ スケジュール変換) は読んでいない
 
 対応カテゴリ：
 
-- **Operant コア** — atomic、special（EXT / CRF）、second-order、compound
-  （全 combinator、位置引数、スカラー kwargs COD / FRCO / BO、PUNISH の 3 形式、
-  directional COD、Overlay target、Interpolate count / onset）、
+- **Operant コア** — atomic、special (EXT / CRF)、second-order、compound
+  (全 combinator、位置引数、スカラー kwargs COD / FRCO / BO、PUNISH の 3 形式、
+  directional COD、Overlay target、Interpolate count / onset)、
   DR / PR / Pctl / Lag / Repeat modifier、LimitedHold 後置、
   TO / ResponseCost 後置、`let` バインディング、プログラム単位パラメータ宣言
 - **嫌悪スケジュール** — Sidman、DiscrimAv、Escape と別名、必須パラメータ検証
 - **状態依存** — Adjusting、Interlocking、Percentile
-- **試行ベース** — MTS、GoNoGo（デフォルト値・correction-mode まで）
+- **試行ベース** — MTS、GoNoGo (デフォルト値・correction-mode まで)
 - **Respondent Tier A** — Pair.{ForwardDelay, ForwardTrace, Simultaneous,
-  Backward}、Extinction、CSOnly、USOnly、Contingency（3 形式）、
-  TrulyRandom（p 対応）、ExplicitlyUnpaired、Compound（mode 付）、Serial、
-  ITI、Differential（full / short）
+  Backward}、Extinction、CSOnly、USOnly、Contingency (3 形式)、
+  TrulyRandom (p 対応)、ExplicitlyUnpaired、Compound (mode 付)、Serial、
+  ITI、Differential (full / short)
 - **Annotation** — `@keyword(...)` をプログラム／スケジュールスコープで解析。
   位置文字列、kwarg、時間単位／パーセント付き数値、リスト／オブジェクトリテラル、
-  負の数値、別名正規化（punisher → reinforcer など）に対応。
+  負の数値、別名正規化 (punisher → reinforcer など) に対応。
   `trial_mix`／declaration-mode MTS 上の `training`・`testing` は
   schedule-scope にルーティング
-- **Experiment** — `phase <Label>:` ブロック（FixedSessions、Stability、
-  ExperimenterJudgment）、`shaping <Label>:` ブロック（artful / percentile、
-  stable()、sessions 基準対応）、`progressive <Label>:` ブロック
-  （`steps v = [...]` テンプレート展開で N 個の `<Label>_1`..`<Label>_N`
-  フェーズを生成）、`experiment <Label>:` paper ブロック（単一スケジュール／
-  phase-sequence body、experiment 単位の注釈オーバーライド対応）、
+- **Experiment** — `phase <Label>:` ブロック (FixedSessions、Stability、
+  ExperimenterJudgment)、`shaping <Label>:` ブロック (artful / percentile、
+  stable()、sessions 基準対応)、`progressive <Label>:` ブロック
+  (`steps v = [...]` テンプレート展開で N 個の `<Label>_1`..`<Label>_N`
+  フェーズを生成)、`experiment <Label>:` paper ブロック (単一スケジュール／
+  phase-sequence body、experiment 単位の注釈オーバーライド対応)、
   `use <Label>` フェーズ参照の解決、digit-form label
 - **Composed** — autoshape、omission、two-process-theory、
   conditioned-suppression、pit
 - **Analyzer** — `let` 束縛を schedule ツリー全体および `SecondOrder`
   overall / unit 位置に展開する binding 展開
-
-対象外：
-
-- `representations/`（T-τ スケジュール変換）は Python リファレンスでは
-  別モジュール（test_t_tau_conversion.py）で扱われる範囲。本クレートの
-  ハーネスでは対象外。
 
 ## 使い方
 
@@ -104,12 +102,16 @@ let tokens = tokenize("FR 10").unwrap();
 
 ## テスト
 
+適合テストは、このリポジトリの隣に置いた contingency-dsl の clone を読む:
+
 ```bash
+git clone https://github.com/OperantKit/contingency-dsl
+git clone https://github.com/OperantKit/contingency-dsl-rs
+cd contingency-dsl-rs
 cargo test
 ```
 
-Conformance ハーネス（[`tests/conformance.rs`](tests/conformance.rs)）は
-言語仕様の全 fixture を走査してファイル単位の通過率を出力する：
+[`tests/conformance.rs`](tests/conformance.rs) の検証環境 (harness) は、ファイル単位の通過率を出力する。これは報告であり、一致しないケースがあってもテストは失敗しない。出力を表示して走らせるには:
 
 ```bash
 cargo test --test conformance -- --nocapture
