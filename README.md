@@ -37,21 +37,26 @@ implement the trait and compose alongside the built-ins.
 
 The test suite reads the language-independent cases in
 [contingency-dsl's `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance)
-and checks three channels:
+and checks four channels:
 
 - **shape** — fixtures with `expected` / `pre_expansion` produce the
   matching JSON shape
 - **warning** — fixtures with `warnings` emit each listed code via
   `collect_warnings()`
 - **error** — fixtures with `error` / `expected_error` produce a
-  `DslError` whose kind and code match
+  `DslError` whose kind and code match, or a diagnostic with that code.
+  The values of `@clock`, `@warmup`, `@algorithm`, `@deprivation` and `@n`
+  are accepted by the parser and reported by the annotation validators;
+  for these, the code comes from the validators
+- **diagnostics** — annotation fixtures with `expected_diagnostics` parse,
+  and the extension registry reports each listed code (four cases whose
+  code neither this crate nor the Python validators report are listed in
+  [`tests/conformance_annotations.rs`](tests/conformance_annotations.rs))
 
-Not matched or not read yet:
+Not read yet:
 
-- some cases in `annotations/procedure-temporal.json` and
-  `annotations/subjects.json` do not produce the expected shape
 - `operant/algebra.json` (`lhs` / `rhs` / `relation` cases) and
-  `representations/` (T-τ schedule conversions) are not read
+  `representations/` (T-τ schedule conversions)
 
 Exercised fixture categories:
 

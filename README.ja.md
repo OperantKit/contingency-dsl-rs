@@ -30,16 +30,16 @@ disjointness 検査)。サードパーティの crate は本 trait を実装し�
 
 ## 適合テスト
 
-テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、3 つの面を調べる:
+テストは、言語に依存しない [contingency-dsl の `conformance/`](https://github.com/OperantKit/contingency-dsl/tree/main/conformance) のケースを読み、4 つの面を調べる:
 
 - **shape** — `expected` / `pre_expansion` のあるケースが、対応する JSON の形になる
 - **warning** — `warnings` のあるケースで、挙げられた各コードが `collect_warnings()` から出る
-- **error** — `error` / `expected_error` のあるケースが、kind と code の一致する `DslError` になる
+- **error** — `error` / `expected_error` のあるケースが、kind と code の一致する `DslError` になるか、そのコードの診断が出る。`@clock`・`@warmup`・`@algorithm`・`@deprivation`・`@n` の値はパーサが受理し、注釈の検査器が報告する。これらのコードは検査器から出る
+- **diagnostics** — 注釈のケースで `expected_diagnostics` のあるものは構文解析が通り、挙げられた各コードを拡張の registry が報告する (この crate でも Python の検査器でも出ない 4 件は [`tests/conformance_annotations.rs`](tests/conformance_annotations.rs) に並べてある)
 
-まだ一致しない、または読んでいない物:
+まだ読んでいない物:
 
-- `annotations/procedure-temporal.json` と `annotations/subjects.json` の一部のケースが、期待される形にならない
-- `operant/algebra.json` (`lhs` / `rhs` / `relation` のケース) と `representations/` (T-τ スケジュール変換) は読んでいない
+- `operant/algebra.json` (`lhs` / `rhs` / `relation` のケース) と `representations/` (T-τ スケジュール変換)
 
 対応カテゴリ：
 

@@ -4765,75 +4765,15 @@ fn validate_annotation(a: &Annotation) -> Result<()> {
                 }
             }
         }
-        "warmup" => {
-            if let Some(params) = params {
-                // duration may be a structured {value, time_unit} or a bare
-                // int/float (e.g. @warmup(duration=0) or duration=30s).
-                let v = annotation_duration_seconds(Some(params), "duration");
-                if let Some(v) = v {
-                    if v <= 0.0 {
-                        return Err(DslError::semantic(
-                            format!("WARMUP_NONPOSITIVE_DURATION: {}", v),
-                            span,
-                        ));
-                    }
-                }
-            }
-        }
-        "clock" => {
-            if let Some(params) = params {
-                if let Some(AnnotationValue::Str(u)) = params.get("unit") {
-                    if !matches!(u.as_str(), "s" | "ms" | "us" | "min") {
-                        return Err(DslError::semantic(
-                            format!("CLOCK_UNKNOWN_UNIT: '{}'", u),
-                            span,
-                        ));
-                    }
-                }
-            }
-        }
-        "algorithm" => {
-            if let Some(params) = params {
-                if let Some(AnnotationValue::Int(n)) = params.get("n") {
-                    if *n <= 0 {
-                        return Err(DslError::semantic(
-                            format!("ALGORITHM_NONPOSITIVE_N: {}", n),
-                            span,
-                        ));
-                    }
-                }
-            }
-        }
-        "deprivation" => {
-            if let Some(params) = params {
-                for key in ["hours", "water_hours", "food_hours"] {
-                    if let Some(AnnotationValue::Int(h)) = params.get(key) {
-                        if *h < 0 {
-                            return Err(DslError::semantic(
-                                format!("DEPRIVATION_NEGATIVE_HOURS: {}={}", key, h),
-                                span,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        "subjects" | "n" => {
+        // `@clock` / `@warmup` / `@algorithm` / `@deprivation` / `@n` values are
+        // not checked here: they parse, and the temporal, subjects and
+        // measurement validators report them.
+        "subjects" => {
             if let Some(params) = params {
                 if let Some(AnnotationValue::Int(n)) = params.get("n") {
                     if *n <= 0 {
                         return Err(DslError::semantic(
                             format!("N_NONPOSITIVE: n={}", n),
-                            span,
-                        ));
-                    }
-                }
-            }
-            if a.keyword == "n" {
-                if let Some(AnnotationValue::Int(n)) = &a.positional {
-                    if *n <= 0 {
-                        return Err(DslError::semantic(
-                            format!("N_NONPOSITIVE: {}", n),
                             span,
                         ));
                     }

@@ -8,7 +8,9 @@
 //!    successfully and produce the matching JSON shape under subset
 //!    comparison;
 //! 2. error channel — fixtures with an `error` object (or `expected_error`)
-//!    must produce a DslError whose `kind` and `code` match;
+//!    must produce a DslError whose `kind` and `code` match, or a diagnostic
+//!    with that code (for `annotations/errors.json`, one from the annotation
+//!    validators);
 //! 3. warning channel — fixtures with a `warnings` list must accumulate a
 //!    diagnostic containing each listed code during analyzer expansion;
 //! 4. algebraic fixtures (`lhs` / `rhs` / `relation`) are skipped.
@@ -17,6 +19,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use contingency_dsl::annotations::measurement::{
+    validate_measurement_annotation, AnnotationScope,
+};
 use contingency_dsl::ast::JsonValue as AstValue;
 use contingency_dsl::{
     expand_bindings, paper_to_json, parse_top_level, phase_sequence_to_json, program_to_json,
@@ -198,7 +203,12 @@ fn conformance_coverage_report() {
                     Ok(top) => {
                         // Parse succeeded; some codes surface only at the
                         // analyzer pass — check collected diagnostics.
-                        let diags = collect_diagnostics(top);
+                        let mut diags = collect_diagnostics(top);
+                        if rel == "annotations/errors.json" && etype == "SemanticError" {
+                            // Annotation values are checked by the annotation
+                            // validators, not by the parser.
+                            diags.extend(program_annotation_codes(top));
+                        }
                         ecode
                             .as_deref()
                             .map(|want| diags.iter().any(|d| d == want))
@@ -361,4 +371,18 @@ fn collect_diagnostics(top: &TopLevel) -> Vec<String> {
         TopLevel::PhaseSequence(s) => s.warnings.clone(),
         TopLevel::Paper(_) => Vec::new(),
     }
+}
+
+/// Codes the annotation validators report for program-level annotations.
+fn program_annotation_codes(top: &TopLevel) -> Vec<String> {
+    let TopLevel::Program(p) = top else {
+        return Vec::new();
+    };
+    p.program_annotations
+        .iter()
+        .flat_map(|a| {
+            validate_measurement_annotation(&a.keyword, a, Some(AnnotationScope::Program))
+        })
+        .map(|d| d.code.to_string())
+        .collect()
 }

@@ -4,9 +4,8 @@
 //! and verifies two channels:
 //!
 //! 1. Success channel — fixtures with an `expected` payload must parse
-//!    without error; the registry's `validate` must produce no diagnostics
-//!    (or the diagnostics must be empty modulo measurement-ext Phase 2
-//!    best-effort validators).
+//!    without error, and every code in `expected_diagnostics` must be
+//!    reported by the registry's `validate`.
 //! 2. Error channel (`errors.json`) — fixtures with `error.type ==
 //!    "SemanticError"` must produce at least one diagnostic whose code
 //!    matches the expected `error.code`, routed through the measurement
@@ -145,6 +144,38 @@ fn parse_program(input: &str) -> ParseOutcome {
     }
 }
 
+/// Cases whose listed code the Python validators do not produce either, so
+/// matching the fixture here would make the two parsers disagree.
+const DIAGNOSTICS_NOT_PRODUCED_BY_PYTHON: &[&str] = &[
+    "apparatus_hardware_alias_collision_negative",
+    "stimulus_reinforcer_conditioned_missing_backup_negative",
+    "stimulus_reinforcer_generalized_one_backup_negative",
+    "stimulus_reinforcer_backup_undeclared_negative",
+];
+
+/// Codes listed in `expected_diagnostics` that no diagnostic starts with.
+fn missing_diagnostics(case: &JsonV, diags: &[String]) -> Vec<String> {
+    let id = case.get("id").and_then(JsonV::as_str).unwrap_or("");
+    if DIAGNOSTICS_NOT_PRODUCED_BY_PYTHON.contains(&id) {
+        return Vec::new();
+    }
+    case.get("expected_diagnostics")
+        .and_then(JsonV::as_array)
+        .map(|codes| {
+            codes
+                .iter()
+                .filter_map(JsonV::as_str)
+                .filter(|code| {
+                    !diags
+                        .iter()
+                        .any(|d| d.split(':').next().map(str::trim) == Some(*code))
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn conformance_annotations() {
     let root = conformance_root();
@@ -270,10 +301,23 @@ fn conformance_annotations() {
                     ParseOutcome::Ok(program) => {
                         let anns_flat: Vec<Annotation> =
                             collect_annotations(&program).into_iter().map(|(a, _)| a).collect();
-                        // Registry is exercised to catch panics only.
-                        let _ = registry.validate(&anns_flat);
-                        success_ok += 1;
-                        ok += 1;
+                        let diags = registry.validate(&anns_flat);
+                        let missing = missing_diagnostics(case, &diags);
+                        if missing.is_empty() {
+                            success_ok += 1;
+                            ok += 1;
+                        } else {
+                            mismatches.push(format!(
+                                "[{}::{}] expected diagnostics {:?} not produced, got {:?}",
+                                filename, id, missing, diags
+                            ));
+                        }
+                    }
+                    ParseOutcome::Err(e) if case.get("expected_diagnostics").is_some() => {
+                        mismatches.push(format!(
+                            "[{}::{}] must parse and be diagnosed by the validators, parser produced {:?}",
+                            filename, id, e.message
+                        ));
                     }
                     ParseOutcome::Err(_) | ParseOutcome::Other => {
                         if std::env::var("VERBOSE_CONFORMANCE").is_ok() {
